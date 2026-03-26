@@ -1,0 +1,238 @@
+﻿apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: slskd-pv
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 1700Gi
+  local:
+    path: /meadia/external/slsk 
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - butiboi
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slskd-pvc
+  namespace: default
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1700Gi
+  volumeMode: Filesystem
+  volumeName: slskd-pv
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: slskd-gluetun-config-0
+    namespace: default
+data:
+  wg0.conf: |
+    [Interface]
+    PrivateKey = qO/mXmil8M2bNLcMcRcaIiChAYMRsl8q09mAXPufeXM=
+    Address = 100.76.127.46/32
+    DNS = 10.255.255.2
+
+    [Peer]
+    PublicKey = 4vd3G8mwnTCk9s2/ow1swsMusVuSTltkFIa56xH+DhE=
+    AllowedIPs = 0.0.0.0/0, ::/0
+    Endpoint = 161.129.60.68:443
+    PresharedKey = 4GCfujtQ6f5jRoVp+tfhXMaiVmA0psJee2G9Mmfh668=
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: slskd-config-0
+    namespace: default
+data:
+  slskd.yaml: |
+    soulseek:
+        username: bigkahuna
+        password: raspberry19
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    run: slskd
+  name: slskd
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      run: slskd
+  serviceName: "slskd"
+  template:
+    metadata:
+      labels:
+        run: slskd
+      annotations:
+        # spoditor.io/mount-volume: |
+        #   {
+        #     "volumes": [
+        #       {
+        #         "name": "gluetun-config-volume",
+        #         "configMap": {
+        #           "name": "gluetun-config"
+        #         }
+        #       },
+        #       {
+        #         "name": "slskd-config-volume",
+        #         "configMap": {
+        #           "name": "slskd-config"
+        #         }
+        #       }
+        #     ],
+        #     "containers": [
+        #       {
+        #         "name": "slskd",
+        #         "volumeMounts": [
+        #           {
+        #             "name": "slskd-config-volume",
+        #             "mountPath": "/config"
+        #           }
+        #         ]
+        #       },
+        #       {
+        #         "name": "gluetun",
+        #         "volumeMounts": [
+        #           {
+        #             "name": "gluetun-config-volume",
+        #             "mountPath": "/gluetun/wireguard"
+        #           }
+        #         ]
+        #       }
+        #     ]
+        #   }
+        spoditor.io/mount-volume: |
+          {
+            "volumes": [
+              {
+                "name": "slskd-config-volume",
+                "configMap": {
+                  "name": "slskd-config"
+                }
+              }
+            ],
+            "containers": [
+              {
+                "name": "slskd",
+                "volumeMounts": [
+                  {
+                    "name": "slskd-config-volume",
+                    "mountPath": "/config"
+                  }
+                ]
+              }
+            ]
+          }
+    spec:
+      volumes:
+      - name: slskd
+        persistentVolumeClaim:
+          claimName: slskd-pvc
+      - name: gluetun
+        persistentVolumeClaim:
+          claimName: gluetun-pvc
+      - name: gluetun-wireguard-config
+        configMap:
+          name: slskd-gluetun-config-0
+      containers:        
+      - name: slskd
+        image: c8n.io/camrose/slskd:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5030
+          protocol: TCP        
+        - containerPort: 5031
+          protocol: TCP
+        - containerPort: 50300
+          protocol: TCP
+        env:
+        - name: SLSKD_SLSK_LISTEN_PORT
+          value: '50300'
+        - name: SLSKD_REMOTE_CONFIGURATION
+          value: 'true'
+        - name: SLSKD_CONFIG
+          value: /config/slskd.yaml
+        volumeMounts:
+        - name: slskd
+          mountPath: /app
+          
+      - name: gluetun
+        image: qmcgaw/gluetun:latest # Optionally you can use the "qmcgaw/gluetun" image as well as specify what version of Gluetun you desire
+        imagePullPolicy: Always
+        
+        volumeMounts:
+        - name: gluetun
+          mountPath: /gluetun
+        - name: gluetun-wireguard-config
+          mountPath: /gluetun/wireguard
+          readOnly: true
+        securityContext:
+          privileged: true
+          capabilities:
+            add: ["NET_ADMIN"]
+        env:
+        - name: VPN_SERVICE_PROVIDER
+          value: "custom"
+        - name: VPN_TYPE
+          value: "wireguard"
+        - name: CUSTOM_VPN_CONFIG_FILE
+          value: "/gluetun/wireguard/wg0.conf"
+        - name: FIREWALL_OUTBOUND_SUBNETS
+          value: "192.168.178.0/24"
+        - name: HEALTH_TARGET_ADDRESS
+          value: "1.1.1.1:443"
+        # - name: LOG_LEVEL
+        #   value: 'DEBUG'
+      initContainers:
+      - name: init-gluetun
+        image: qmcgaw/gluetun
+        command: ['sh', '-c', '/gluetun-entrypoint update -enduser -providers windscribe']
+        volumeMounts:
+        - name: gluetun
+          mountPath: /gluetun
+
+      imagePullSecrets:
+      - name: c8n-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slskd
+  labels:
+    run: slskd
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  ports:
+   - port: 5030
+     name: webui-1
+     targetPort: 5030
+     protocol: TCP    
+   - port: 5031
+     name: webui-2
+     targetPort: 5031
+     protocol: TCP    
+   - port: 50300
+     name: server
+     targetPort: 50300
+     protocol: TCP
+  selector:
+    run: slskd

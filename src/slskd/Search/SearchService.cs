@@ -110,6 +110,7 @@ namespace slskd.Search
             using var context = ContextFactory.CreateDbContext();
 
             var selector = context.Searches
+                //.Include("Responses")
                 .AsNoTracking()
                 .Where(expression);
 
@@ -155,9 +156,11 @@ namespace slskd.Search
 
             var rateLimiter = new RateLimiter(250);
 
+            var searchText = query.SearchText.Replace("\u2014", string.Empty).Replace("\u2013", string.Empty);
+
             var search = new Search()
             {
-                SearchText = query.SearchText,
+                SearchText = searchText,
                 Token = token,
                 Id = id,
                 State = SearchStates.Requested,
@@ -199,7 +202,7 @@ namespace slskd.Search
                 }));
 
             var soulseekSearchTask = Client.SearchAsync(
-                query,
+                SearchQuery.FromText(searchText),
                 responseHandler: (response) => responses.Add(response),
                 scope,
                 token,

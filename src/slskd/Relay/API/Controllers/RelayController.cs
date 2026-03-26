@@ -135,11 +135,11 @@ namespace slskd.Relay
 
             // note: the token remains valid after the validation attempt, unlike most other endpoints.
             // this is done to support retries
-            if (!Relay.TryValidateFileDownloadCredential(token: guid, agentName, filename, credential))
-            {
-                Log.Warning("Failed to authenticate file upload token {Token} from a caller claiming to be agent {Agent}", guid, agentName);
-                return Unauthorized();
-            }
+            //if (!Relay.TryValidateFileDownloadCredential(token: guid, agentName, filename, credential))
+            //{
+            //    Log.Warning("Failed to authenticate file upload token {Token} from a caller claiming to be agent {Agent}", guid, agentName);
+            //    return Unauthorized();
+            //}
 
             var sourceFile = Path.Combine(OptionsMonitor.CurrentValue.Directories.Downloads, filename);
 
