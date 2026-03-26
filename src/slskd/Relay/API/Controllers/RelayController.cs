@@ -42,6 +42,9 @@ namespace slskd.Relay
     [ApiController]
     public class RelayController : ControllerBase
     {
+        private const long ONE_GIBIBYTE = 1L * 1024L * 1024L * 1024L; // 1073741824
+        private const long ONE_TEBIBYTE = 1024L * ONE_GIBIBYTE; // 1099511627776
+
         /// <summary>
         ///     Initializes a new instance of the <see cref="RelayController"/> class.
         /// </summary>
@@ -105,7 +108,7 @@ namespace slskd.Relay
         /// <returns></returns>
         [HttpGet("controller/downloads/{token}")]
         [Authorize(Policy = AuthPolicy.ApiKeyOnly, Roles = AuthRole.Any)]
-        public IActionResult DownloadFile([FromRoute]string token)
+        public IActionResult DownloadFile([FromRoute] string token)
         {
             if (!OptionsAtStartup.Relay.Enabled || !new[] { RelayMode.Controller, RelayMode.Debug }.Contains(OperationMode))
             {
@@ -155,8 +158,8 @@ namespace slskd.Relay
         /// <param name="token">The unique identifier for the request.</param>
         /// <returns></returns>
         [HttpPost("controller/files/{token}")]
-        [RequestSizeLimit(10L * 1024L * 1024L * 1024L)]
-        [RequestFormLimits(MultipartBodyLengthLimit = 10L * 1024L * 1024L * 1024L)]
+        [RequestSizeLimit(10L * ONE_TEBIBYTE)]
+        [RequestFormLimits(MultipartBodyLengthLimit = 10L * ONE_TEBIBYTE)]
         [DisableFormValueModelBinding]
         [Authorize(Policy = AuthPolicy.ApiKeyOnly, Roles = AuthRole.ReadWriteOrAdministrator)]
         public async Task<IActionResult> UploadFile(string token)
@@ -253,6 +256,8 @@ namespace slskd.Relay
         /// <param name="token">The unique identifier for the request.</param>
         /// <returns></returns>
         [HttpPost("controller/shares/{token}")]
+        [RequestSizeLimit(ONE_TEBIBYTE)]
+        [RequestFormLimits(MultipartBodyLengthLimit = ONE_TEBIBYTE)]
         [Authorize(Policy = AuthPolicy.ApiKeyOnly, Roles = AuthRole.ReadWriteOrAdministrator)]
         public async Task<IActionResult> UploadShares(string token)
         {

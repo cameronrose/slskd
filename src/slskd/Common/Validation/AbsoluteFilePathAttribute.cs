@@ -1,4 +1,4 @@
-﻿// <copyright file="MetricsController.cs" company="slskd Team">
+﻿// <copyright file="AbsoluteFilePathAttribute.cs" company="slskd Team">
 //     Copyright (c) slskd Team. All rights reserved.
 //
 //     This program is free software: you can redistribute it and/or modify
@@ -15,33 +15,29 @@
 //     along with this program.  If not, see https://www.gnu.org/licenses/.
 // </copyright>
 
-namespace slskd.Core.API
+namespace slskd.Validation
 {
-    using System.Threading.Tasks;
-    using Asp.Versioning;
-    using Microsoft.AspNetCore.Authorization;
-    using Microsoft.AspNetCore.Mvc;
+    using System.ComponentModel.DataAnnotations;
+    using System.IO;
 
     /// <summary>
-    ///     Logs.
+    ///     Validates that the specified path is absolute.
     /// </summary>
-    [Route("api/v{version:apiVersion}/[controller]")]
-    [ApiVersion("0")]
-    [ApiController]
-    [Produces("text/plain")]
-    [Consumes("text/plain")]
-    public class MetricsController : ControllerBase
+    public class AbsoluteFilePathAttribute : ValidationAttribute
     {
-        /// <summary>
-        ///     Gets application metrics.
-        /// </summary>
-        /// <returns></returns>
-        [HttpGet]
-        [Authorize(Policy = AuthPolicy.Any)]
-        public async Task<IActionResult> Get()
+        protected override ValidationResult IsValid(object value, ValidationContext validationContext)
         {
-            var response = await Metrics.BuildAsync();
-            return Content(response, "text/plain");
+            if (value != null)
+            {
+                var filePath = value.ToString();
+
+                if (!string.IsNullOrEmpty(filePath) && !Path.IsPathRooted(filePath))
+                {
+                    return new ValidationResult($"The {validationContext.DisplayName} field must specify an absolute file path.");
+                }
+            }
+
+            return ValidationResult.Success;
         }
     }
 }

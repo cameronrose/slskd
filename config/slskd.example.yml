@@ -1,4 +1,5 @@
 # debug: false
+# headless: false
 # remote_configuration: false
 # remote_file_management: false
 # instance_name: default
@@ -9,11 +10,15 @@
 #   no_connect: false
 #   no_share_scan: false
 #   force_share_scan: false
+#   force_migrations: false
 #   no_version_check: false
 #   log_sql: false
+#   log_unobserved_exceptions: false
 #   experimental: false
 #   volatile: false
 #   case_sensitive_reg_ex: false
+#   legacy_windows_tcp_keepalive: false
+#   optimistic_relay_file_info: false
 # relay:
 #   enabled: false
 #   mode: controller # controller (default), agent, or debug (for local development)
@@ -32,6 +37,9 @@
 #       instance_name: my_agent # make sure the top-level instance_name of the agent matches!
 #       secret: <a 16-255 character string unique to this agent>
 #       cidr: 0.0.0.0/0,::/0
+# permissions:
+#   file:
+#     mode: ~ # not for Windows, chmod syntax, e.g. 644, 777. can't escalate beyond umask
 # directories:
 #   incomplete: ~
 #   downloads: ~
@@ -46,89 +54,95 @@
 #     storage_mode: memory
 #     workers: 16
 #     retention: ~ # retain indefinitely (do not automatically re-scan)
-# rooms:
-#   - ~
-# global:
+# transfers:
 #   upload:
 #     slots: 20
 #     speed_limit: 1000 # in kibibytes
-#   limits:
-#     queued:
-#       files: 500
-#       megabytes: 5000
-#     daily:
-#       files: 1000
-#       megabytes: 10000
-#       failures: 200
-#     weekly:
-#       files: 5000
-#       megabytes: 50000
-#       failures: 1000
+#     limits:
+#       queued:
+#         files: 500
+#         megabytes: 5000
+#       daily:
+#         files: 1000
+#         megabytes: 10000
+#         failures: 200
+#       weekly:
+#         files: 5000
+#         megabytes: 50000
+#         failures: 1000
 #   download:
 #     slots: 500
 #     speed_limit: 1000
-# groups:
-#   default:
-#     upload:
-#       priority: 500
-#       strategy: roundrobin
-#       slots: 10
-#     limits:
-#       queued:
-#         files: 150
-#         megabytes: 1500
-#       daily: ~ # no daily limits (weekly still apply)
-#       weekly:
-#         files: 1500
-#         megabytes: 15000
-#         failures: 150
-#   leechers:
-#     thresholds:
-#       files: 1
-#       directories: 1
-#     upload:
-#       priority: 999
-#       strategy: roundrobin
-#       slots: 1
-#       speed_limit: 100
-#     limits:
-#       queued:
-#         files: 15
-#         megabytes: 150
-#       daily:
-#         files: 30
-#         megabytes: 300
-#         failures: 10
-#       weekly:
-#         files: 150
-#         megabytes: 1500
-#         failures: 30
-#   blacklisted:
-#     members:
-#       - <username to blacklist>
-#     cidrs:
-#       - <CIDR to blacklist, e.g. 255.255.255.255/32>
-#   user_defined:
-#     my_buddies:
+#   groups:
+#     default:
 #       upload:
-#         priority: 250
-#         strategy: firstinfirstout
+#         priority: 500
+#         strategy: roundrobin
 #         slots: 10
-#       limits:
-#         queued:
-#           files: 1000 # override global default
+#         limits:
+#           queued:
+#             files: 150
+#             megabytes: 1500
+#           daily: ~ # no daily limits (weekly still apply)
+#           weekly:
+#             files: 1500
+#             megabytes: 15000
+#             failures: 150
+#     leechers:
+#       thresholds:
+#         files: 1
+#         directories: 1
+#       upload:
+#         priority: 999
+#         strategy: roundrobin
+#         slots: 1
+#         speed_limit: 100
+#         limits:
+#           queued:
+#             files: 15
+#             megabytes: 150
+#           daily:
+#             files: 30
+#             megabytes: 300
+#             failures: 10
+#           weekly:
+#             files: 150
+#             megabytes: 1500
+#             failures: 30
+#     blacklisted:
 #       members:
-#         - alice
-#         - bob
+#         - <username to blacklist>
+#       cidrs:
+#         - <CIDR to blacklist, e.g. 255.255.255.255/32>
+#     user_defined:
+#       my_buddies:
+#         upload:
+#           priority: 250
+#           strategy: firstinfirstout
+#           slots: 10
+#           limits:
+#             queued:
+#               files: 1000 # override global default
+#         members:
+#           - alice
+#           - bob
+# blacklist:
+#   enabled: true
+#   file: <path to file containing CIDRs to blacklist>
 # filters:
 #   search:
 #     request:
 #       - ^.{1,2}$
+# rooms:
+#   - ~
 # web:
 #   port: 5030
+#   ip_address: 0.0.0.0,[::]
+#   socket: ~
 #   https:
 #     disabled: false
 #     port: 5031
+#     ip_address: 0.0.0.0,[::]
 #     force: false
 #     certificate:
 #       pfx: ~
@@ -149,21 +163,31 @@
 #         role: readonly # readonly, readwrite, administrator
 #         cidr: 0.0.0.0/0,::/0
 # retention:
+#   search: 10080 # 7 days, in minutes
 #   transfers:
 #     upload:
-#       succeeded: 1440 # 1 day
+#       succeeded: 1440 # 1 day, in minutes
 #       errored: 30
 #       cancelled: 5
+#       failed: 180 # any unsuccessful transfer, including errored and cancelled
 #     download:
-#       succeeded: 1440 # 1 day
-#       errored: 20160 # 2 weeks 
+#       succeeded: 1440 # 1 day, in minutes
+#       errored: 20160 # 2 weeks, in minutes
 #       cancelled: 5
+#       failed: 180 # any unsuccessful transfer, including errored and cancelled
 #   files:
-#     complete: 20160 # 2 weeks
-#     incomplete: 43200 # 30 days
-#   logs: 259200 # 180 days
+#     complete: 20160 # 2 weeks, in minutes
+#     incomplete: 43200 # 30 days, in minutes
+#   logs: 180 # days
+# throttling:
+#   search:
+#     incoming:
+#       concurrency: 10 # number of search requests to process at the same time
+#       circuit_breaker: 500 # maximum number of pending search requests
+#       response_file_limit: 500 # maximum number of files to return in a single search response
 # logger:
-#   disk: true
+#   disk: false
+#   no_color: false
 #   loki: ~
 # metrics:
 #   enabled: false
@@ -181,6 +205,7 @@
 #   password: ~
 #   description: |
 #     A slskd user. https://github.com/slskd/slskd
+#   picture: path/to/slsk-profile-picture.jpg
 #   listen_ip_address: 0.0.0.0
 #   listen_port: 50300
 #   diagnostic_level: Info
@@ -193,6 +218,7 @@
 #     timeout:
 #       connect: 10000
 #       inactivity: 15000
+#       transfer: 30000
 #     buffer:
 #       read: 16384
 #       write: 16384
@@ -204,7 +230,80 @@
 #       port: ~
 #       username: ~
 #       password: ~
-# integration:
+# integrations:
+#   vpn:
+#     enabled: false
+#     port_forwarding: false
+#     polling_interval: 2500
+#     gluetun:
+#       url: http://localhost:8000
+#       timeout: 1000
+#       auth: apikey # or basic or none
+#       api_key: <gluetun API key>
+#       username: <username if using basic auth>
+#       password: <password if using basic auth>
+#   webhooks:
+#     my_webhook:
+#       on:
+#         - DownloadFileComplete
+#       call:
+#         url: https://192.168.1.42:8080/slskd_webhook
+#         headers:
+#           - name: X-API-Key
+#             value: foobar1234
+#           - name: Authorization
+#             value: Bearer eyJ...ssw5c
+#           - name: User-Agent
+#             value: slskd/0.0
+#         ignore_certificate_errors: false
+#       timeout: 5000 # in milliseconds
+#       retry:
+#         attempts: 3
+#   scripts:
+#     run_command_with_linux_system_shell: # automatically uses the executable defined in $SHELL
+#       on:
+#         - DownloadFileComplete
+#       run:
+#         command: 'echo "$SLSKD_SCRIPT_DATA" >> linux_system_shell.txt'
+#     run_with_sh:
+#       on:
+#         - DownloadFileComplete
+#       run:
+#         executable: /bin/sh
+#         args: '-c "echo $SLSKD_SCRIPT_DATA >> linux_sh.txt"'
+#     run_with_sh_and_args_list:
+#       on:
+#         - DownloadFileComplete
+#       run:
+#         executable: /bin/sh
+#         arglist:
+#           - -c
+#           - echo $SLSKD_SCRIPT_DATA >> linux_sh_and_args_list.txt
+#     run_command_with_windows_system_shell: # automatically uses cmd.exe (included with all Windows installs)
+#       on:
+#         - DownloadFileComplete
+#       run:
+#         command: 'echo "%SLSKD_SCRIPT_DATA%" >> windows_system_shell.txt'
+#     run_with_windows_cmd:
+#       on:
+#         - DownloadFileComplete
+#       run:
+#         executable: cmd.exe
+#         args: '/c "echo "%SLSKD_SCRIPT_DATA%" >> windows_cmd.txt"'
+#     run_with_windows_git_bash:
+#       on:
+#         - DownloadFileComplete
+#       run:
+#         executable: C:\Program Files\Git\bin\bash.exe
+#         args: '-c "echo "$SLSKD_SCRIPT_DATA" >> windows_git_bash.txt"'
+#     run_with_windows_cmd_and_args_list:
+#       on:
+#         - DownloadFileComplete
+#       run:
+#         executable: cmd.exe
+#         arglist:
+#           - /c
+#           - 'echo "%SLSKD_SCRIPT_DATA%" >> windows_cmd_and_args_list.txt'
 #   ftp:
 #     enabled: false
 #     address: ~

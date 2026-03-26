@@ -87,7 +87,7 @@ namespace slskd.Shares
         Scan FindLatestScan();
 
         /// <summary>
-        ///     Flags the latest scan as suspect, indicating that the cached contents may have divered from physical storage.
+        ///     Flags the latest scan as suspect, indicating that the cached contents may have diverged from physical storage.
         /// </summary>
         void FlagLatestScanAsSuspect();
 
@@ -167,8 +167,9 @@ namespace slskd.Shares
         ///     Searches the database for files matching the specified <paramref name="query"/>.
         /// </summary>
         /// <param name="query">The search query.</param>
+        /// <param name="limit">An optional row limit.</param>
         /// <returns>The list of matching files.</returns>
-        IEnumerable<File> Search(SearchQuery query);
+        IEnumerable<File> Search(SearchQuery query, int? limit = null);
 
         /// <summary>
         ///     Attempts to validate the backing database.

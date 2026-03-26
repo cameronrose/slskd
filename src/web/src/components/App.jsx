@@ -43,6 +43,7 @@ const initialState = {
 };
 
 const ModeSpecificConnectButton = ({
+  connectionWatchdog,
   controller = {},
   mode,
   pendingReconnect,
@@ -85,45 +86,62 @@ const ModeSpecificConnectButton = ({
       </Menu.Item>
     );
   } else {
-    return (
-      <>
-        {server?.isConnected && (
-          <Menu.Item onClick={() => disconnect()}>
-            <Icon.Group className="menu-icon-group">
-              <Icon
-                color={pendingReconnect ? 'yellow' : 'green'}
-                name="plug"
-              />
-              {user?.privileges?.isPrivileged && (
-                <Icon
-                  className="menu-icon-no-shadow"
-                  color="yellow"
-                  corner
-                  name="star"
-                />
-              )}
-            </Icon.Group>
-            Connected
-          </Menu.Item>
-        )}
-        {!server?.isConnected && (
-          <Menu.Item onClick={() => connect()}>
-            <Icon.Group className="menu-icon-group">
-              <Icon
-                color="grey"
-                name="plug"
-              />
+    if (server?.isConnected) {
+      return (
+        <Menu.Item onClick={() => disconnect()}>
+          <Icon.Group className="menu-icon-group">
+            <Icon
+              color={pendingReconnect ? 'yellow' : 'green'}
+              name="plug"
+            />
+            {user?.privileges?.isPrivileged && (
               <Icon
                 className="menu-icon-no-shadow"
-                color="red"
-                corner="bottom right"
-                name="close"
+                color="yellow"
+                corner
+                name="star"
               />
-            </Icon.Group>
-            Disconnected
-          </Menu.Item>
-        )}
-      </>
+            )}
+          </Icon.Group>
+          Connected
+        </Menu.Item>
+      );
+    }
+
+    // the server is disconnected, and we need to give the user some information about what the client is doing
+    // options are:
+    // - nothing. the client was manually disconnected, kicked off by another login, etc., and we're not trying to connect
+    // - actively trying to make a connection to the server
+    // - still trying to connect, but waiting for the next connection attempt
+    let icon = 'close';
+    let color = 'red';
+
+    if (connectionWatchdog?.isAttemptingConnection) {
+      icon = 'clock';
+      color = 'yellow';
+    }
+
+    if (server?.isConnecting || server?.IsLoggingIn) {
+      icon = 'sync alternate loading';
+      color = 'green';
+    }
+
+    return (
+      <Menu.Item onClick={() => connect()}>
+        <Icon.Group className="menu-icon-group">
+          <Icon
+            color="grey"
+            name="plug"
+          />
+          <Icon
+            className="menu-icon-no-shadow"
+            color={color}
+            corner="bottom right"
+            name={icon}
+          />
+        </Icon.Group>
+        Disconnected
+      </Menu.Item>
     );
   }
 };
@@ -136,18 +154,21 @@ class App extends Component {
   }
 
   componentDidMount() {
-    window
-      .matchMedia('(prefers-color-scheme: dark)')
-      .addEventListener(
-        'change',
-        (event) => event.matches && this.setState({ theme: 'dark' }),
-      );
-    window
-      .matchMedia('(prefers-color-scheme: light)')
-      .addEventListener(
-        'change',
-        (event) => event.matches && this.setState({ theme: 'light' }),
-      );
+    if (this.getSavedTheme() == null) {
+      window
+        .matchMedia('(prefers-color-scheme: dark)')
+        .addEventListener(
+          'change',
+          (event) => event.matches && this.setState({ theme: 'dark' }),
+        );
+      window
+        .matchMedia('(prefers-color-scheme: light)')
+        .addEventListener(
+          'change',
+          (event) => event.matches && this.setState({ theme: 'light' }),
+        );
+    }
+
     this.init();
   }
 
@@ -185,6 +206,11 @@ class App extends Component {
           await appHub.start();
         }
 
+        const savedTheme = this.getSavedTheme();
+        if (savedTheme != null) {
+          this.setState({ theme: savedTheme });
+        }
+
         this.setState({
           error: false,
         });
@@ -194,6 +220,18 @@ class App extends Component {
       } finally {
         this.setState({ initialized: true });
       }
+    });
+  };
+
+  getSavedTheme = () => {
+    return localStorage.getItem('slskd-theme');
+  };
+
+  toggleTheme = () => {
+    this.setState((state) => {
+      const newTheme = state.theme === 'dark' ? 'light' : 'dark';
+      localStorage.setItem('slskd-theme', newTheme);
+      return { theme: newTheme };
     });
   };
 
@@ -238,11 +276,13 @@ class App extends Component {
       initialized,
       login,
       retriesExhausted,
-      theme = window.matchMedia('(prefers-color-scheme: dark)').matches
-        ? 'dark'
-        : 'light',
+      theme = this.getSavedTheme() ||
+        (window.matchMedia('(prefers-color-scheme: dark)').matches
+          ? 'dark'
+          : 'light'),
     } = this.state;
     const {
+      connectionWatchdog = {},
       pendingReconnect,
       pendingRestart,
       relay = {},
@@ -383,15 +423,12 @@ class App extends Component {
               className="right"
               inverted
             >
-              <Menu.Item
-                onClick={() =>
-                  this.setState({ theme: theme === 'dark' ? 'light' : 'dark' })
-                }
-              >
+              <Menu.Item onClick={() => this.toggleTheme()}>
                 <Icon name="theme" />
                 Theme
               </Menu.Item>
               <ModeSpecificConnectButton
+                connectionWatchdog={connectionWatchdog}
                 controller={controller}
                 mode={mode}
                 pendingReconnect={pendingReconnect}

@@ -20,10 +20,12 @@ using Microsoft.Extensions.Options;
 namespace slskd.Search.API
 {
     using System;
+    using System.Threading;
     using System.Threading.Tasks;
     using Asp.Versioning;
     using Microsoft.AspNetCore.Authorization;
     using Microsoft.AspNetCore.Mvc;
+    using Serilog;
     using SearchQuery = Soulseek.SearchQuery;
     using SearchScope = Soulseek.SearchScope;
 
@@ -32,7 +34,6 @@ namespace slskd.Search.API
     /// </summary>
     [Route("api/v{version:apiVersion}/[controller]")]
     [ApiVersion("0")]
-    [ApiController]
     [Produces("application/json")]
     [Consumes("application/json")]
     public class SearchesController : ControllerBase
@@ -48,8 +49,10 @@ namespace slskd.Search.API
             OptionsSnapshot = optionsSnapshot;
         }
 
+        private static SemaphoreSlim SearchRequestLimiter { get; } = new SemaphoreSlim(1, 1);
         private ISearchService Searches { get; }
         private IOptionsSnapshot<Options> OptionsSnapshot { get; }
+        private ILogger Log { get; set; } = Serilog.Log.ForContext<SearchesController>();
 
         /// <summary>
         ///     Performs a search for the specified <paramref name="request"/>.
@@ -68,29 +71,47 @@ namespace slskd.Search.API
                 return Forbid();
             }
 
-            if (string.IsNullOrWhiteSpace(request.SearchText))
+            if (!ModelState.IsValid)
             {
-                return BadRequest("SearchText may not be null or empty");
+                return BadRequest(ModelState.GetReadableString());
             }
 
-            var id = request.Id ?? Guid.NewGuid();
-
-            Search search;
+            if (!SearchRequestLimiter.Wait(0))
+            {
+                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
+            }
 
             try
             {
-                search = await Searches.StartAsync(id, SearchQuery.FromText(request.SearchText), SearchScope.Network, request.ToSearchOptions());
-            }
-            catch (Exception ex) when (ex is ArgumentException || ex is Soulseek.DuplicateTokenException)
-            {
-                return BadRequest(ex.Message);
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Conflict(ex.Message);
-            }
+                var id = request.Id ?? Guid.NewGuid();
 
-            return Ok(search);
+                Search search;
+
+                try
+                {
+                    search = await Searches.StartAsync(id, SearchQuery.FromText(request.SearchText), SearchScope.Network, request.ToSearchOptions());
+                    return Ok(search);
+                }
+                catch (Exception ex) when (ex is ArgumentException || ex is Soulseek.DuplicateTokenException)
+                {
+                    Log.Error(ex, "Failed to execute search {Search}: {Message}", request, ex.Message);
+                    return BadRequest(ex.Message);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    Log.Error(ex, "Failed to execute search {Search}: {Message}", request, ex.Message);
+                    return Conflict(ex.Message);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Failed to execute search {Search}: {Message}", request, ex.Message);
+                    return StatusCode(500, ex.Message);
+                }
+            }
+            finally
+            {
+                SearchRequestLimiter.Release();
+            }
         }
 
         /// <summary>
@@ -210,7 +231,7 @@ namespace slskd.Search.API
                 return Forbid();
             }
 
-            var search = await Searches.FindAsync(search => search.Id == id, includeResponses: true);
+            var search = await Searches.FindAsync(search => search.Id == id, includeResponses: false);
 
             if (search == default)
             {

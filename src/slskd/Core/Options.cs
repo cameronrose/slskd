@@ -24,6 +24,7 @@ namespace slskd
     using System.ComponentModel;
     using System.ComponentModel.DataAnnotations;
     using System.Diagnostics;
+    using System.IO;
     using System.Linq;
     using System.Text.Json.Serialization;
     using System.Text.RegularExpressions;
@@ -31,13 +32,14 @@ namespace slskd
     using NetTools;
     using slskd.Authentication;
     using slskd.Configuration;
+    using slskd.Events;
     using slskd.Relay;
     using slskd.Shares;
     using slskd.Validation;
-    using Soulseek.Diagnostics;
     using Utility.CommandLine;
     using Utility.EnvironmentVariables;
     using YamlDotNet.Serialization;
+    using SoulseekDiagnostics = Soulseek.Diagnostics;
 
     /// <summary>
     ///     Disambiguates options derived at startup from options that may update at run time.
@@ -113,7 +115,7 @@ namespace slskd
         /// <summary>
         ///     Gets a value indicating whether to display a list of configuration environment variables.
         /// </summary>
-        [Argument('e', "envars")]
+        [Argument(default, "envars")]
         [Description("display environment variables")]
         [Obsolete("Used only for documentation; see Program for actual implementation")]
         [JsonIgnore]
@@ -123,7 +125,7 @@ namespace slskd
         /// <summary>
         ///     Gets a value indicating whether to generate an X509 certificate and password.
         /// </summary>
-        [Argument('g', "generate-cert")]
+        [Argument(default, "generate-cert")]
         [Description("generate X509 certificate and password for HTTPS")]
         [Obsolete("Used only for documentation; see Program for actual implementation")]
         [JsonIgnore]
@@ -133,7 +135,7 @@ namespace slskd
         /// <summary>
         ///     Gets a value indicating whether to generate a random secret.
         /// </summary>
-        [Argument('k', "generate-secret")]
+        [Argument(default, "generate-secret")]
         [Description("generate random secret of the specified length")]
         [Obsolete("Used only for documentation; see Program for actual implementation")]
         [JsonIgnore]
@@ -148,6 +150,15 @@ namespace slskd
         [Description("run in debug mode")]
         [RequiresRestart]
         public bool Debug { get; init; } = Debugger.IsAttached;
+
+        /// <summary>
+        ///     Gets a value indicating whether the application should run in headless (no web UI) mode.
+        /// </summary>
+        [Argument('H', "headless")]
+        [EnvironmentVariable("HEADLESS")]
+        [Description("run in headless (no web UI) mode")]
+        [RequiresRestart]
+        public bool Headless { get; init; } = false;
 
         /// <summary>
         ///     Gets a value indicating whether remote configuration of options is allowed.
@@ -209,6 +220,12 @@ namespace slskd
         public RelayOptions Relay { get; init; } = new RelayOptions();
 
         /// <summary>
+        ///     Gets permission options.
+        /// </summary>
+        [Validate]
+        public PermissionsOptions Permissions { get; init; } = new PermissionsOptions();
+
+        /// <summary>
         ///     Gets directory options.
         /// </summary>
         [Validate]
@@ -222,16 +239,16 @@ namespace slskd
         public SharesOptions Shares { get; init; } = new SharesOptions();
 
         /// <summary>
-        ///     Gets global options.
+        ///     Gets transfer options.
         /// </summary>
         [Validate]
-        public GlobalOptions Global { get; init; } = new GlobalOptions();
+        public TransfersOptions Transfers { get; init; } = new TransfersOptions();
 
         /// <summary>
-        ///     Gets user groups.
+        ///     Gets blacklist options.
         /// </summary>
         [Validate]
-        public GroupsOptions Groups { get; init; } = new GroupsOptions();
+        public BlacklistOptions Blacklist { get; init; } = new BlacklistOptions();
 
         /// <summary>
         ///     Gets filter options.
@@ -258,6 +275,12 @@ namespace slskd
         /// </summary>
         [Validate]
         public RetentionOptions Retention { get; init; } = new RetentionOptions();
+
+        /// <summary>
+        ///     Gets throttling options.
+        /// </summary>
+        [Validate]
+        public ThrottlingOptions Throttling { get; init; } = new ThrottlingOptions();
 
         /// <summary>
         ///     Gets logger options.
@@ -290,7 +313,7 @@ namespace slskd
         ///     Gets options for external integrations.
         /// </summary>
         [Validate]
-        public IntegrationOptions Integration { get; init; } = new IntegrationOptions();
+        public IntegrationsOptions Integrations { get; init; } = new IntegrationsOptions();
 
         /// <summary>
         ///     Handles top-level validation that doesn't fit anywhere else.
@@ -369,6 +392,14 @@ namespace slskd
             public bool ForceShareScan { get; init; } = false;
 
             /// <summary>
+            ///     Gets a value indicating whether to force database migrations to be applied on startup.
+            /// </summary>
+            [Argument(default, "force-migrations")]
+            [EnvironmentVariable("FORCE_MIGRATIONS")]
+            [Description("force database migrations to be applied on startup")]
+            public bool ForceMigrations { get; init; } = false;
+
+            /// <summary>
             ///     Gets a value indicating whether the application should check for a newer version on startup.
             /// </summary>
             [Argument(default, "no-version-check")]
@@ -385,6 +416,15 @@ namespace slskd
             [Description("log SQL queries generated by Entity Framework")]
             [RequiresRestart]
             public bool LogSQL { get; init; } = false;
+
+            /// <summary>
+            ///     Gets a value indicating whether to log unobserved Exceptions.
+            /// </summary>
+            [Argument(default, "log-unobserved-exceptions")]
+            [EnvironmentVariable("LOG_UNOBSERVED_EXCEPTIONS")]
+            [Description("log unobserved exceptions (caution: verbose)")]
+            [RequiresRestart]
+            public bool LogUnobservedExceptions { get; init; } = false;
 
             /// <summary>
             ///     Gets a value indicating whether the application should run in experimental mode.
@@ -412,6 +452,32 @@ namespace slskd
             [Description("user-defined regular expressions are case sensitive")]
             [RequiresRestart]
             public bool CaseSensitiveRegEx { get; init; } = false;
+
+            /// <summary>
+            ///     Gets a value indicating whether to use legacy TCP keepalive options, for Windows
+            ///     versions prior to Windows 10, version 1709 (and associated Server SKUs).
+            /// </summary>
+            [Argument(default, "legacy-windows-tcp-keepalive")]
+            [EnvironmentVariable("LEGACY_WINDOWS_TCP_KEEPALIVE")]
+            [Description("use a legacy TCP keepalive strategy for older Windows versions")]
+            public bool LegacyWindowsTcpKeepalive { get; init; } = false;
+
+            /// <summary>
+            ///     Gets a value indicating whether to use the uploaded shares from Relay agents as the source of
+            ///     truth for file existence and size, instead of querying the agent prior to enqueueing the file.
+            /// </summary>
+            [Argument(default, "optimistic-relay-file-info")]
+            [EnvironmentVariable("OPTIMISTIC_RELAY_FILE_INFO")]
+            [Description("use uploaded relay shares as source of truth for file existence and size")]
+            public bool OptimisticRelayFileInfo { get; init; } = false;
+
+            /// <summary>
+            ///     Gets a value indicating whether SQLite pooling should be disabled.
+            /// </summary>
+            [Argument(default, "no-sqlite-pooling")]
+            [EnvironmentVariable("NO_SQLITE_POOLING")]
+            [Description("disable SQLite pooling")]
+            public bool NoSqlitePooling { get; init; } = false;
         }
 
         /// <summary>
@@ -582,11 +648,67 @@ namespace slskd
                     {
                         try
                         {
+                            if (cidr.StartsWith("::ffff", StringComparison.OrdinalIgnoreCase))
+                            {
+                                throw new Exception("IPv4 mapped IPv6 addresses are not allowed");
+                            }
+
                             _ = IPAddressRange.Parse(cidr);
                         }
                         catch (Exception ex)
                         {
                             results.Add(new ValidationResult($"CIDR {cidr} is invalid: {ex.Message}"));
+                        }
+                    }
+
+                    return results;
+                }
+            }
+        }
+
+        /// <summary>
+        ///     Permission options.
+        /// </summary>
+        public class PermissionsOptions
+        {
+            /// <summary>
+            ///     Gets file permission options.
+            /// </summary>
+            [Validate]
+            public FileOptions File { get; init; } = new FileOptions();
+
+            /// <summary>
+            ///     File permission options.
+            /// </summary>
+            public class FileOptions : IValidatableObject
+            {
+                /// <summary>
+                ///     Gets the permissions to apply to newly created files.
+                /// </summary>
+                /// <remarks>
+                ///     Applicable to non-Windows operating systems, only.
+                /// </remarks>
+                [Argument(default, "file-permission-mode")]
+                [EnvironmentVariable("FILE_PERMISSION_MODE")]
+                [Description("the permissions to apply to newly created files (chmod syntax, non-Windows only)")]
+                public string Mode { get; init; }
+
+                /// <summary>
+                ///     Extended validation.
+                /// </summary>
+                /// <param name="validationContext"></param>
+                /// <returns></returns>
+                public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+                {
+                    var results = new List<ValidationResult>();
+
+                    if (!string.IsNullOrEmpty(Mode))
+                    {
+                        var regEx = new Regex("^[0-7]{3,4}$", RegexOptions.Compiled);
+
+                        if (!regEx.IsMatch(Mode))
+                        {
+                            results.Add(new ValidationResult($"Field {nameof(Mode)} is invalid. Specify a three- or four-character string consisting of only 0-7 (chmod syntax, [0]000-[7]777, inclusive)"));
                         }
                     }
 
@@ -671,7 +793,7 @@ namespace slskd
 
                 bool IsBlankPath(string share) => Regex.IsMatch(share.LocalizePath(), @"^(!|-){0,1}(\[.*\])$");
                 directories?.Where(share => IsBlankPath(share)).ToList()
-                    .ForEach(blank => results.Add(new ValidationResult($"Share {blank} doees not specify a path")));
+                    .ForEach(blank => results.Add(new ValidationResult($"Share {blank} does not specify a path")));
 
                 bool IsRootMount(string share) => Regex.IsMatch(share.LocalizePath(), @"^(!|-){0,1}(\[.*\])/$");
                 directories?.Where(share => IsRootMount(share)).ToList()
@@ -776,9 +898,9 @@ namespace slskd
         }
 
         /// <summary>
-        ///     Global options.
+        ///     Transfer options.
         /// </summary>
-        public class GlobalOptions
+        public class TransfersOptions
         {
             /// <summary>
             ///     Gets global upload options.
@@ -787,16 +909,16 @@ namespace slskd
             public GlobalUploadOptions Upload { get; init; } = new GlobalUploadOptions();
 
             /// <summary>
-            ///     Gets global limits.
-            /// </summary>
-            [Validate]
-            public LimitsOptions Limits { get; init; } = new LimitsOptions();
-
-            /// <summary>
             ///     Gets global download options.
             /// </summary>
             [Validate]
             public GlobalDownloadOptions Download { get; init; } = new GlobalDownloadOptions();
+
+            /// <summary>
+            ///     Gets user groups.
+            /// </summary>
+            [Validate]
+            public GroupsOptions Groups { get; init; } = new GroupsOptions();
 
             /// <summary>
             ///     Global upload options.
@@ -821,6 +943,12 @@ namespace slskd
                 [Description("the total upload speed limit")]
                 [Range(1, int.MaxValue)]
                 public int SpeedLimit { get; init; } = int.MaxValue;
+
+                /// <summary>
+                ///     Gets global limits.
+                /// </summary>
+                [Validate]
+                public LimitsOptions Limits { get; init; } = new LimitsOptions();
             }
 
             /// <summary>
@@ -847,144 +975,42 @@ namespace slskd
                 [Range(1, int.MaxValue)]
                 public int SpeedLimit { get; init; } = int.MaxValue;
             }
-        }
-
-        /// <summary>
-        ///     Limit options.
-        /// </summary>
-        public class LimitsOptions
-        {
-            /// <summary>
-            ///     Gets limits for queued transfers.
-            /// </summary>
-            [Validate]
-            public Limits Queued { get; init; } = new Limits();
 
             /// <summary>
-            ///     Gets daily limits for transfers.
+            ///     User groups.
             /// </summary>
-            [Validate]
-            public Limits Daily { get; init; } = new Limits();
-
-            /// <summary>
-            ///     Gets weekly limits for transfers.
-            /// </summary>
-            [Validate]
-            public Limits Weekly { get; init; } = new Limits();
-
-            /// <summary>
-            ///     Limits.
-            /// </summary>
-            public class Limits
+            public class GroupsOptions : IValidatableObject
             {
                 /// <summary>
-                ///     Gets the limit for number of files.
+                ///     Gets options for the default user group.
                 /// </summary>
-                [Range(1, int.MaxValue)]
-                public int? Files { get; init; } = null;
+                /// <remarks>
+                ///     These options apply to users that are not privileged, have not been identified as leechers,
+                ///     and have not been added as a member of any group.
+                /// </remarks>
+                [Validate]
+                public BaseGroupOptions Default { get; init; } = new BaseGroupOptions();
 
                 /// <summary>
-                ///     Gets the limit for number of megabytes.
+                ///     Gets options for the leecher user group.
                 /// </summary>
-                [Range(1, int.MaxValue)]
-                public int? Megabytes { get; init; } = null;
+                /// <remarks>
+                ///     These options apply to users that have been identified as leechers, and have not been added as a member of any group.
+                /// </remarks>
+                [Validate]
+                public LeecherOptions Leechers { get; init; } = new LeecherOptions();
 
                 /// <summary>
-                ///     Gets the limit for number of failures.
-                /// </summary>
-                [Range(1, int.MaxValue)]
-                public int? Failures { get; init; } = null;
-            }
-        }
-
-        /// <summary>
-        ///     User groups.
-        /// </summary>
-        public class GroupsOptions : IValidatableObject
-        {
-            /// <summary>
-            ///     Gets options for the default user group.
-            /// </summary>
-            /// <remarks>
-            ///     These options apply to users that are not privileged, have not been identified as leechers,
-            ///     and have not been added as a member of any group.
-            /// </remarks>
-            [Validate]
-            public BuiltInOptions Default { get; init; } = new BuiltInOptions();
-
-            /// <summary>
-            ///     Gets options for the leecher user group.
-            /// </summary>
-            /// <remarks>
-            ///     These options apply to users that have been identified as leechers, and have not been added as a member of any group.
-            /// </remarks>
-            [Validate]
-            public LeecherOptions Leechers { get; init; } = new LeecherOptions();
-
-            /// <summary>
-            ///     Gets options for the blacklisted user group.
-            /// </summary>
-            [Validate]
-            public BlacklistedOptions Blacklisted { get; init; } = new BlacklistedOptions();
-
-            /// <summary>
-            ///     Gets user defined groups and options.
-            /// </summary>
-            [Validate]
-            public Dictionary<string, UserDefinedOptions> UserDefined { get; init; } = new Dictionary<string, UserDefinedOptions>();
-
-            /// <summary>
-            ///     Extended validation.
-            /// </summary>
-            /// <param name="validationContext"></param>
-            /// <returns></returns>
-            public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
-            {
-                var builtInGroups = new[] { Application.PrivilegedGroup, Application.DefaultGroup, Application.LeecherGroup };
-                var intersection = UserDefined.Keys.Intersect(builtInGroups);
-
-                return intersection.Select(group => new ValidationResult($"User defined group '{group}' collides with a built in group.  Choose a different name."));
-            }
-
-            /// <summary>
-            ///     Options that are common to all groups.
-            /// </summary>
-            public class GroupOptions
-            {
-                /// <summary>
-                ///     Gets upload options.
+                ///     Gets options for the blacklisted user group.
                 /// </summary>
                 [Validate]
-                public UploadOptions Upload { get; init; } = new UploadOptions();
+                public BlacklistedOptions Blacklisted { get; init; } = new BlacklistedOptions();
 
                 /// <summary>
-                ///     Gets limit options.
+                ///     Gets user defined groups and options.
                 /// </summary>
                 [Validate]
-                public LimitsOptions Limits { get; init; } = new LimitsOptions();
-            }
-
-            /// <summary>
-            ///     Built in user group options.
-            /// </summary>
-            public class BuiltInOptions : GroupOptions
-            {
-            }
-
-            /// <summary>
-            ///     Built in blacklisted group options.
-            /// </summary>
-            public class BlacklistedOptions : IValidatableObject
-            {
-                /// <summary>
-                ///     Gets the list of group member usernames.
-                /// </summary>
-                public string[] Members { get; init; } = Array.Empty<string>();
-
-                /// <summary>
-                ///     Gets the list of group CIDRs.
-                /// </summary>
-                public string[] Cidrs { get; init; } = Array.Empty<string>();
+                public Dictionary<string, UserDefinedOptions> UserDefined { get; init; } = new Dictionary<string, UserDefinedOptions>();
 
                 /// <summary>
                 ///     Extended validation.
@@ -993,93 +1019,193 @@ namespace slskd
                 /// <returns></returns>
                 public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
                 {
-                    var results = new List<ValidationResult>();
+                    var builtInGroups = new[] { Application.PrivilegedGroup, Application.DefaultGroup, Application.LeecherGroup };
+                    var intersection = UserDefined.Keys.Intersect(builtInGroups);
 
-                    foreach (var cidr in Cidrs ?? Array.Empty<string>())
+                    return intersection.Select(group => new ValidationResult($"User defined group '{group}' collides with a built in group.  Choose a different name."));
+                }
+
+                /// <summary>
+                ///     Options that are common to all groups.
+                /// </summary>
+                public class BaseGroupOptions
+                {
+                    /// <summary>
+                    ///     Gets upload options.
+                    /// </summary>
+                    [Validate]
+                    public GroupUploadOptions Upload { get; init; } = new GroupUploadOptions();
+
+                    /// <summary>
+                    ///     User group upload options.
+                    /// </summary>
+                    public class GroupUploadOptions
                     {
-                        try
-                        {
-                            _ = IPAddressRange.Parse(cidr);
-                        }
-                        catch (Exception ex)
-                        {
-                            results.Add(new ValidationResult($"CIDR {cidr} is invalid: {ex.Message}"));
-                        }
-                    }
+                        /// <summary>
+                        ///     Gets the priority of the group.
+                        /// </summary>
+                        [Range(1, int.MaxValue)]
+                        public int Priority { get; init; } = 1;
 
-                    return results;
+                        /// <summary>
+                        ///     Gets the queue strategy for the group.
+                        /// </summary>
+                        [Enum(typeof(Transfers.QueueStrategy))]
+                        public string Strategy { get; init; } = slskd.Transfers.QueueStrategy.RoundRobin.ToString().ToLowerInvariant();
+
+                        /// <summary>
+                        ///     Gets the limit for the total number of upload slots for the group.
+                        /// </summary>
+                        [Range(1, int.MaxValue)]
+                        public int Slots { get; init; } = int.MaxValue;
+
+                        /// <summary>
+                        ///     Gets the total upload speed limit for the group, in kibibytes.
+                        /// </summary>
+                        [Range(1, int.MaxValue)]
+                        public int SpeedLimit { get; init; } = int.MaxValue;
+
+                        /// <summary>
+                        ///     Gets limit options.
+                        /// </summary>
+                        [Validate]
+                        public LimitsOptions Limits { get; init; } = new LimitsOptions();
+                    }
+                }
+
+                /// <summary>
+                ///     Built in leecher group options.
+                /// </summary>
+                public class LeecherOptions : BaseGroupOptions
+                {
+                    /// <summary>
+                    ///     Gets leecher threshold options.
+                    /// </summary>
+                    [Validate]
+                    public ThresholdOptions Thresholds { get; init; } = new ThresholdOptions();
+
+                    /// <summary>
+                    ///     Leecher threshold options.
+                    /// </summary>
+                    public class ThresholdOptions
+                    {
+                        /// <summary>
+                        ///     Gets the minimum number of shared files required to avoid being classified as a leecher.
+                        /// </summary>
+                        [Range(1, int.MaxValue)]
+                        public int Files { get; init; } = 1;
+
+                        /// <summary>
+                        ///     Gets the minimum number of shared directories required to avoid being classified as a leecher.
+                        /// </summary>
+                        [Range(1, int.MaxValue)]
+                        public int Directories { get; init; } = 1;
+                    }
+                }
+
+                /// <summary>
+                ///     Built in blacklisted group options.
+                /// </summary>
+                public class BlacklistedOptions : IValidatableObject
+                {
+                    /// <summary>
+                    ///     Gets the list of group member usernames.
+                    /// </summary>
+                    public string[] Members { get; init; } = Array.Empty<string>();
+
+                    /// <summary>
+                    ///     Gets the list of group CIDRs.
+                    /// </summary>
+                    public string[] Cidrs { get; init; } = Array.Empty<string>();
+
+                    /// <summary>
+                    ///     Extended validation.
+                    /// </summary>
+                    /// <param name="validationContext"></param>
+                    /// <returns></returns>
+                    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+                    {
+                        var results = new List<ValidationResult>();
+
+                        foreach (var cidr in Cidrs ?? Array.Empty<string>())
+                        {
+                            try
+                            {
+                                if (cidr.StartsWith("::ffff", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    throw new Exception("IPv4 mapped IPv6 addresses are not allowed");
+                                }
+
+                                _ = IPAddressRange.Parse(cidr);
+                            }
+                            catch (Exception ex)
+                            {
+                                results.Add(new ValidationResult($"CIDR {cidr} is invalid: {ex.Message}"));
+                            }
+                        }
+
+                        return results;
+                    }
+                }
+
+                /// <summary>
+                ///     User defined user group options.
+                /// </summary>
+                public class UserDefinedOptions : BaseGroupOptions
+                {
+                    /// <summary>
+                    ///     Gets the list of group member usernames.
+                    /// </summary>
+                    public string[] Members { get; init; } = Array.Empty<string>();
                 }
             }
 
             /// <summary>
-            ///     Built in leecher group options.
+            ///     Limit options.
             /// </summary>
-            public class LeecherOptions : GroupOptions
+            public class LimitsOptions
             {
                 /// <summary>
-                ///     Gets leecher threshold options.
+                ///     Gets limits for queued transfers.
                 /// </summary>
                 [Validate]
-                public ThresholdOptions Thresholds { get; init; } = new ThresholdOptions();
-            }
-
-            /// <summary>
-            ///     Leecher threshold options.
-            /// </summary>
-            public class ThresholdOptions
-            {
-                /// <summary>
-                ///     Gets the minimum number of shared files required to avoid being classified as a leecher.
-                /// </summary>
-                [Range(1, int.MaxValue)]
-                public int Files { get; init; } = 1;
+                public Limits Queued { get; init; } = new Limits();
 
                 /// <summary>
-                ///     Gets the minimum number of shared directories required to avoid being classified as a leecher.
+                ///     Gets daily limits for transfers.
                 /// </summary>
-                [Range(1, int.MaxValue)]
-                public int Directories { get; init; } = 1;
-            }
-
-            /// <summary>
-            ///     User defined user group options.
-            /// </summary>
-            public class UserDefinedOptions : GroupOptions
-            {
-                /// <summary>
-                ///     Gets the list of group member usernames.
-                /// </summary>
-                public string[] Members { get; init; } = Array.Empty<string>();
-            }
-
-            /// <summary>
-            ///     User group upload options.
-            /// </summary>
-            public class UploadOptions
-            {
-                /// <summary>
-                ///     Gets the priority of the group.
-                /// </summary>
-                [Range(1, int.MaxValue)]
-                public int Priority { get; init; } = 1;
+                [Validate]
+                public Limits Daily { get; init; } = new Limits();
 
                 /// <summary>
-                ///     Gets the queue strategy for the group.
+                ///     Gets weekly limits for transfers.
                 /// </summary>
-                [Enum(typeof(Transfers.QueueStrategy))]
-                public string Strategy { get; init; } = Transfers.QueueStrategy.RoundRobin.ToString().ToLowerInvariant();
+                [Validate]
+                public Limits Weekly { get; init; } = new Limits();
 
                 /// <summary>
-                ///     Gets the limit for the total number of upload slots for the group.
+                ///     Limits.
                 /// </summary>
-                [Range(1, int.MaxValue)]
-                public int Slots { get; init; } = int.MaxValue;
+                public class Limits
+                {
+                    /// <summary>
+                    ///     Gets the limit for number of files.
+                    /// </summary>
+                    [Range(1, int.MaxValue)]
+                    public int? Files { get; init; } = null;
 
-                /// <summary>
-                ///     Gets the total upload speed limit for the group, in kibibytes.
-                /// </summary>
-                [Range(1, int.MaxValue)]
-                public int SpeedLimit { get; init; } = int.MaxValue;
+                    /// <summary>
+                    ///     Gets the limit for number of megabytes.
+                    /// </summary>
+                    [Range(1, int.MaxValue)]
+                    public int? Megabytes { get; init; } = null;
+
+                    /// <summary>
+                    ///     Gets the limit for number of failures.
+                    /// </summary>
+                    [Range(1, int.MaxValue)]
+                    public int? Failures { get; init; } = null;
+                }
             }
         }
 
@@ -1096,6 +1222,67 @@ namespace slskd
             [Description("enable swagger documentation and UI")]
             [RequiresRestart]
             public bool Swagger { get; init; } = false;
+        }
+
+        /// <summary>
+        ///     Blacklist options.
+        /// </summary>
+        public class BlacklistOptions : IValidatableObject
+        {
+            /// <summary>
+            ///     Gets a value indicating whether blacklist file support should be enabled.
+            /// </summary>
+            [Argument(default, "enable-blacklist")]
+            [EnvironmentVariable("BLACKLIST")]
+            [Description("enable blacklist file support")]
+            [RequiresRestart]
+            public bool Enabled { get; init; }
+
+            /// <summary>
+            ///     Gets the path to the blacklist file.
+            /// </summary>
+            [Argument(default, "blacklist-file")]
+            [EnvironmentVariable("BLACKLIST_FILE")]
+            [Description("path to blacklist file")]
+            [FileExists(FileAccess.Read)]
+            public string File { get; init; }
+
+            /// <summary>
+            ///     Extended validation.
+            /// </summary>
+            /// <param name="validationContext"></param>
+            /// <returns></returns>
+            public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+            {
+                var results = new List<ValidationResult>();
+
+                if (!Enabled)
+                {
+                    return results;
+                }
+
+                if (string.IsNullOrWhiteSpace(File))
+                {
+                    results.Add(new ValidationResult("The Enabled field is true, but no File has been specified."));
+                    return results;
+                }
+
+                // loading/validating the entire list will be costly on low spec systems
+                // just make sure that we can detect a valid format and leave it at that
+                // if there's a problem with any of the entries, the load will fail and
+                // kill the application
+                try
+                {
+                    // async not supported here, .Result is all we have
+                    _ = slskd.Blacklist.DetectFormat(File).Result;
+                }
+                catch
+                {
+                    results.Add(new ValidationResult("Failed to detect blacklist format. Only CIDR, P2P and DAT formats are supported"));
+                }
+
+                return results;
+            }
         }
 
         /// <summary>
@@ -1161,11 +1348,20 @@ namespace slskd
             /// <summary>
             ///     Gets a value indicating whether to write logs to disk.
             /// </summary>
-            [Argument(default, "no-disk-logger")]
-            [EnvironmentVariable("NO_DISK_LOGGER")]
-            [Description("disable logging to disk")]
+            [Argument(default, "disk-logger")]
+            [EnvironmentVariable("DISK_LOGGER")]
+            [Description("enable logging to disk")]
             [RequiresRestart]
-            public bool Disk { get; init; } = true;
+            public bool Disk { get; init; } = false;
+
+            /// <summary>
+            ///     Gets a value indicating whether to suppress colorization of console logs.
+            /// </summary>
+            [Argument(default, "no-color")]
+            [EnvironmentVariable("NO_COLOR")]
+            [Description("disable console log colors")]
+            [RequiresRestart]
+            public bool NoColor { get; init; } = false;
         }
 
         /// <summary>
@@ -1173,6 +1369,12 @@ namespace slskd
         /// </summary>
         public class RetentionOptions
         {
+            /// <summary>
+            ///     Gets the time to retain searches, in minutes.
+            /// </summary>
+            [Range(5, maximum: int.MaxValue)]
+            public int? Search { get; init; } = null;
+
             /// <summary>
             ///     Gets transfer retention options.
             /// </summary>
@@ -1230,6 +1432,12 @@ namespace slskd
                     /// </summary>
                     [Range(5, maximum: int.MaxValue)]
                     public int? Cancelled { get; init; } = null;
+
+                    /// <summary>
+                    ///     Gets the time to retain unsuccessful (including errored and cancelled) transfers, in minutes.
+                    /// </summary>
+                    [Range(5, maximum: int.MaxValue)]
+                    public int? Failed { get; init; } = null;
                 }
             }
 
@@ -1249,6 +1457,61 @@ namespace slskd
                 /// </summary>
                 [Range(30, maximum: int.MaxValue)]
                 public int? Incomplete { get; init; } = null;
+            }
+        }
+
+        /// <summary>
+        ///     Throttling options.
+        /// </summary>
+        public class ThrottlingOptions
+        {
+            /// <summary>
+            ///     Gets search throttling options.
+            /// </summary>
+            [Validate]
+            public SearchThrottlingOptions Search { get; init; } = new SearchThrottlingOptions();
+
+            /// <summary>
+            ///     Search throttling options.
+            /// </summary>
+            public class SearchThrottlingOptions
+            {
+                /// <summary>
+                ///     Gets incoming search throttling options.
+                /// </summary>
+                [Validate]
+                public IncomingSearchThrottlingOptions Incoming { get; init; } = new IncomingSearchThrottlingOptions();
+
+                /// <summary>
+                ///     Search response throttling options.
+                /// </summary>
+                public class IncomingSearchThrottlingOptions
+                {
+                    /// <summary>
+                    ///     Gets the limit for the number of concurrent search response operations.
+                    /// </summary>
+                    [Argument(default, "throttling-search-incoming-concurrency")]
+                    [EnvironmentVariable("THROTTLING_SEARCH_INCOMING_CONCURRENCY")]
+                    [Range(1, 100)]
+                    [RequiresRestart]
+                    public int Concurrency { get; init; } = 10;
+
+                    /// <summary>
+                    ///     Gets the limit for the number of queued search response operations, after which requests will be discarded.
+                    /// </summary>
+                    [Argument(default, "throttling-search-incoming-circuit-breaker")]
+                    [EnvironmentVariable("THROTTLING_SEARCH_INCOMING_CIRCUIT_BREAKER")]
+                    [Range(100, 10000)]
+                    public int CircuitBreaker { get; init; } = 500;
+
+                    /// <summary>
+                    ///     Gets the limit for the number of files that can be returned in a single search request.
+                    /// </summary>
+                    [Argument(default, "throttling-search-incoming-response-file-limit")]
+                    [EnvironmentVariable("THROTTLING_SEARCH_INCOMING_RESPONSE_FILE_LIMIT")]
+                    [Range(100, 5000)]
+                    public int ResponseFileLimit { get; init; } = 500;
+                }
             }
         }
 
@@ -1370,6 +1633,15 @@ namespace slskd
             public string Description { get; init; } = "A slskd user. https://github.com/slskd/slskd";
 
             /// <summary>
+            ///     Gets the file path for the user's profile picture.
+            /// </summary>
+            [Argument(default, "slsk-picture")]
+            [EnvironmentVariable("SLSK_PICTURE")]
+            [Description("user picture for the Soulseek network")]
+            [FileExists(FileAccess.Read)]
+            public string Picture { get; init; } = null;
+
+            /// <summary>
             ///     Gets the local IP address on which to listen for incoming connections.
             /// </summary>
             [Argument(default, "slsk-listen-ip-address")]
@@ -1393,8 +1665,9 @@ namespace slskd
             [Argument(default, "slsk-diag-level")]
             [EnvironmentVariable("SLSK_DIAG_LEVEL")]
             [Description("minimum diagnostic level (None, Warning, Info, Debug)")]
+            [Enum(typeof(SoulseekDiagnostics.DiagnosticLevel))]
             [RequiresRestart]
-            public DiagnosticLevel DiagnosticLevel { get; init; } = DiagnosticLevel.Info;
+            public string DiagnosticLevel { get; init; } = SoulseekDiagnostics.DiagnosticLevel.Info.ToString().ToLowerInvariant();
 
             /// <summary>
             ///     Gets options for the distributed network.
@@ -1495,6 +1768,15 @@ namespace slskd
                     [Description("connection inactivity timeout, in milliseconds")]
                     [Range(1000, int.MaxValue)]
                     public int Inactivity { get; init; } = 15000;
+
+                    /// <summary>
+                    ///     Gets the transfer connection timeout, in milliseconds.
+                    /// </summary>
+                    [Argument(default, "slsk-transfer-timeout")]
+                    [EnvironmentVariable("SLSK_TRANSFER_TIMEOUT")]
+                    [Description("transfer connection timeout, in milliseconds")]
+                    [Range(30_000, int.MaxValue)]
+                    public int Transfer { get; init; } = 60000;
                 }
 
                 /// <summary>
@@ -1627,6 +1909,26 @@ namespace slskd
             public int Port { get; init; } = 5030;
 
             /// <summary>
+            ///     Gets the comma separated list of IPv4 or IPv6 IP addresses on which to listen for HTTP requests.
+            /// </summary>
+            [Argument(default, "http-ip-address")]
+            [EnvironmentVariable("HTTP_IP_ADDRESS")]
+            [Description("IP addresses on which to listen for HTTP requests")]
+            [IPAddress(allowCommaSeparatedValues: true)]
+            [RequiresRestart]
+            public string IpAddress { get; init; }
+
+            /// <summary>
+            ///     Gets the HTTP listen unix domain socket (UDS) path.
+            /// </summary>
+            [Argument(default, "http-socket")]
+            [EnvironmentVariable("HTTP_SOCKET")]
+            [Description("HTTP listen unix domain socket (UDS) path for web UI")]
+            [AbsoluteFilePath]
+            [RequiresRestart]
+            public string Socket { get; init; }
+
+            /// <summary>
             ///     Gets HTTPS options.
             /// </summary>
             [Validate]
@@ -1671,7 +1973,7 @@ namespace slskd
             /// <summary>
             ///     Authentication options.
             /// </summary>
-            public class WebAuthenticationOptions
+            public class WebAuthenticationOptions : IValidatableObject
             {
                 /// <summary>
                 ///     Gets a value indicating whether authentication should be disabled.
@@ -1709,10 +2011,93 @@ namespace slskd
                 public JwtOptions Jwt { get; init; } = new JwtOptions();
 
                 /// <summary>
+                ///     Gets the primary API key.  Defaults to 'Administrator' role and CIDR '0.0.0.0/0,::/0'.
+                ///     role and CIDR can be supplied by prefixing the key with 'role=[role];cidr=[cidrs];[key]'.
+                /// </summary>
+                [Argument('k', "api-key")]
+                [EnvironmentVariable("API_KEY")]
+                [Description("primary API key value")]
+                [Secret]
+                [RequiresRestart]
+                public string ApiKey { get; init; }
+
+                /// <summary>
                 ///     Gets API keys.
                 /// </summary>
                 [Validate]
                 public Dictionary<string, ApiKeyOptions> ApiKeys { get; init; } = new Dictionary<string, ApiKeyOptions>();
+
+                public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+                {
+                    var results = new List<ValidationResult>();
+
+                    if (string.IsNullOrWhiteSpace(ApiKey))
+                    {
+                        return results;
+                    }
+
+                    var tuples = ApiKey.Split(';');
+
+                    // if only one tuple is supplied, it's just the key, no role or list of CIDRs
+                    if (tuples.Length == 1)
+                    {
+                        var key = tuples.FirstOrDefault();
+
+                        if (key?.Length < 16 || key?.Length > 255)
+                        {
+                            results.Add(new ValidationResult("API key must be between 16 and 255 characters"));
+                        }
+
+                        return results;
+                    }
+
+                    /*
+                        if multiple tuples are supplied, verify that:
+
+                        * if a tuple starts with 'role=', it's defining a role and it must match one of the Role enum values
+                        * if a tuple starts with 'cidr=', it's defining a list of CIDRs which need to be valid
+                        * if a tuple doesn't start with a prefix, it's the API key itself and it must be between 16 and 255 characters
+                    */
+                    foreach (var tuple in tuples)
+                    {
+                        if (tuple.StartsWith("role=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var role = tuple.Split('=').LastOrDefault();
+
+                            if (!Enum.TryParse(typeof(Role), value: role, ignoreCase: true, out _))
+                            {
+                                results.Add(new ValidationResult($"API key role must be one of: {string.Join(", ", Enum.GetNames(typeof(Role)))}"));
+                            }
+                        }
+                        else if (tuple.StartsWith("cidr=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var cidrs = tuple.Split('=').LastOrDefault();
+
+                            foreach (var cidr in cidrs.Split(','))
+                            {
+                                try
+                                {
+                                    if (cidr.StartsWith("::ffff", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        throw new Exception("IPv4 mapped IPv6 addresses are not allowed");
+                                    }
+
+                                    _ = IPAddressRange.Parse(cidr);
+                                }
+                                catch (Exception ex)
+                                {
+                                    results.Add(new ValidationResult($"API key CIDR {cidr} is invalid: {ex.Message}"));
+                                }
+                            }
+                        }
+                        else if (tuple?.Length < 16 || tuple?.Length > 255)
+                        {
+                            results.Add(new ValidationResult("API key must be between 16 and 255 characters"));
+                        }
+                    }
+
+                    return results;
+                }
 
                 /// <summary>
                 ///     JWT options.
@@ -1780,6 +2165,11 @@ namespace slskd
                         {
                             try
                             {
+                                if (cidr.StartsWith("::ffff", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    throw new Exception("IPv4 mapped IPv6 addresses are not allowed");
+                                }
+
                                 _ = IPAddressRange.Parse(cidr);
                             }
                             catch (Exception ex)
@@ -1818,6 +2208,16 @@ namespace slskd
                 public int Port { get; init; } = 5031;
 
                 /// <summary>
+                ///     Gets the comma separated list of IPv4 or IPv6 IP addresses on which to listen for HTTPS requests.
+                /// </summary>
+                [Argument(default, "https-ip-address")]
+                [EnvironmentVariable("HTTPS_IP_ADDRESS")]
+                [Description("IP addresses on which to listen for HTTPS requests")]
+                [IPAddress(allowCommaSeparatedValues: true)]
+                [RequiresRestart]
+                public string IpAddress { get; init; }
+
+                /// <summary>
                 ///     Gets a value indicating whether HTTP requests should be redirected to HTTPS.
                 /// </summary>
                 [Argument('f', "force-https")]
@@ -1845,7 +2245,7 @@ namespace slskd
                     [Argument(default, "https-cert-pfx")]
                     [EnvironmentVariable("HTTPS_CERT_PFX")]
                     [Description("path to X509 certificate .pfx")]
-                    [FileExists]
+                    [FileExists(FileAccess.Read)]
                     [RequiresRestart]
                     public string Pfx { get; init; }
 
@@ -1865,8 +2265,26 @@ namespace slskd
         /// <summary>
         ///     Options for external integrations.
         /// </summary>
-        public class IntegrationOptions
+        public class IntegrationsOptions
         {
+            /// <summary>
+            ///     Gets VPN options.
+            /// </summary>
+            [Validate]
+            public VpnOptions Vpn { get; init; } = new();
+
+            /// <summary>
+            ///     Gets webhook configuration.
+            /// </summary>
+            [Validate]
+            public Dictionary<string, WebhookOptions> Webhooks { get; init; } = [];
+
+            /// <summary>
+            ///     Gets script configuration.
+            /// </summary>
+            [Validate]
+            public Dictionary<string, ScriptOptions> Scripts { get; init; } = [];
+
             /// <summary>
             ///     Gets FTP options.
             /// </summary>
@@ -1878,6 +2296,279 @@ namespace slskd
             /// </summary>
             [Validate]
             public PushbulletOptions Pushbullet { get; init; } = new PushbulletOptions();
+
+            /// <summary>
+            ///     VPN options.
+            /// </summary>
+            public class VpnOptions : IValidatableObject
+            {
+                /// <summary>
+                ///     Gets a value indicating whether the VPN integration is enabled.
+                /// </summary>
+                [Argument(default, "vpn")]
+                [EnvironmentVariable("VPN")]
+                [Description("enable VPN integration")]
+                [RequiresRestart]
+                public bool Enabled { get; init; } = false;
+
+                /// <summary>
+                ///     Gets a value indicating whether the configured VPN supports dynamic port forwarding.
+                /// </summary>
+                [Argument(default, "vpn-port-forwarding")]
+                [EnvironmentVariable("VPN_PORT_FORWARDING")]
+                [Description("VPN supports dynamic port forwarding")]
+                public bool PortForwarding { get; init; } = false;
+
+                /// <summary>
+                ///     Gets the rate at which to poll the configured VPN client for status updates, in milliseconds.
+                /// </summary>
+                [Argument(default, "vpn-polling-interval")]
+                [EnvironmentVariable("VPN_POLLING_INTERVAL")]
+                [Description("VPN client status polling interval")]
+                [Range(500, int.MaxValue)]
+                [RequiresRestart]
+                public int PollingInterval { get; init; } = 2500;
+
+                /// <summary>
+                ///     Gets Gluetun options.
+                /// </summary>
+                [Validate]
+                public GluetunVpnOptions Gluetun { get; init; } = new GluetunVpnOptions();
+
+                public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+                {
+                    if (Enabled)
+                    {
+                        // as/if more VPN clients are added, update this logic to ensure that exactly one is configured
+                        if (string.IsNullOrWhiteSpace(Gluetun?.Url))
+                        {
+                            yield return new ValidationResult("VPN is enabled but no client is configured");
+                            yield break;
+                        }
+
+                        if (!Uri.TryCreate(Gluetun.Url, UriKind.Absolute, out _))
+                        {
+                            yield return new ValidationResult("The gluetun URL must be absolute, e.g. 'http://127.0.0.1:8000'");
+                        }
+                    }
+                }
+
+                /// <summary>
+                ///     Gluetun options.
+                /// </summary>
+                public class GluetunVpnOptions
+                {
+                    /// <summary>
+                    ///     Gets the Gluetun integration version.
+                    /// </summary>
+                    /// <remarks>
+                    ///     Only v1 of the Gluetun API exists right now; this is to ease a transition if there's ever a v2.
+                    /// </remarks>
+                    [Range(1, 1)]
+                    public int Version { get; init; } = 1;
+
+                    /// <summary>
+                    ///     Gets the fully qualified root URL for the Gluetun control server.
+                    /// </summary>
+                    [Argument(default, "vpn-gluetun-url")]
+                    [EnvironmentVariable("VPN_GLUETUN_URL")]
+                    [Description("URL for gluetun control server")]
+                    public string Url { get; init; }
+
+                    /// <summary>
+                    ///     Gets the timeout for HTTP requests to the Gluetun control server, in milliseconds.
+                    /// </summary>
+                    [Argument(default, "vpn-gluetun-timeout")]
+                    [EnvironmentVariable("VPN_GLUETUN_TIMEOUT")]
+                    [Description("timeout for HTTP requests to gluetun control server")]
+                    [Range(500, 10_000)]
+                    public int Timeout { get; init; } = 1000;
+
+                    /// <summary>
+                    ///     Gets the username used for basic auth.
+                    /// </summary>
+                    [Argument(default, "vpn-gluetun-username")]
+                    [EnvironmentVariable("VPN_GLUETUN_USERNAME")]
+                    [Description("username for gluetun control server")]
+                    public string Username { get; init; }
+
+                    /// <summary>
+                    ///     Gets the password used for basic auth.
+                    /// </summary>
+                    [Argument(default, "vpn-gluetun-password")]
+                    [EnvironmentVariable("VPN_GLUETUN_PASSWORD")]
+                    [Description("password for gluetun control server")]
+                    [Secret]
+                    public string Password { get; init; }
+
+                    /// <summary>
+                    ///     Gets the API key used for API key auth.
+                    /// </summary>
+                    [Argument(default, "vpn-gluetun-api-key")]
+                    [EnvironmentVariable("VPN_GLUETUN_API_KEY")]
+                    [Description("API key for gluetun control server")]
+                    [Secret]
+                    public string ApiKey { get; init; }
+                }
+            }
+
+            /// <summary>
+            ///     Webhook configuration.
+            /// </summary>
+            public class WebhookOptions
+            {
+                /// <summary>
+                ///     Gets the list of Event types that trigger the webhook.
+                /// </summary>
+                [Enum(typeof(EventType))]
+                public string[] On { get; init; } = Array.Empty<string>();
+
+                /// <summary>
+                ///     Gets details about the webhook call.
+                /// </summary>
+                [Validate]
+                public WebhookHttpOptions Call { get; init; } = new WebhookHttpOptions();
+
+                /// <summary>
+                ///     Gets the time to wait before timing out, in milliseconds.
+                /// </summary>
+                [Range(500, int.MaxValue)]
+                public int Timeout { get; init; } = 5000;
+
+                /// <summary>
+                ///     Gets the retry configuration.
+                /// </summary>
+                [Validate]
+                public RetryOptions Retry { get; init; } = new RetryOptions();
+            }
+
+            /// <summary>
+            ///     Webhook HTTP options.
+            /// </summary>
+            public class WebhookHttpOptions : IValidatableObject
+            {
+                /// <summary>
+                ///     Gets the fully qualified URL for the webhook.
+                /// </summary>
+                [NotNullOrWhiteSpace]
+                public string Url { get; init; }
+
+                /// <summary>
+                ///     Gets the HTTP headers to include with the webhook.
+                /// </summary>
+                [Validate]
+                public WebhookHttpHeader[] Headers { get; init; } = [];
+
+                /// <summary>
+                ///     Gets a value indicating whether HTTPS certificate errors should be ignored.
+                /// </summary>
+                public bool IgnoreCertificateErrors { get; init; } = false;
+
+                public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+                {
+                    if (!Url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !Url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                    {
+                        yield return new ValidationResult($"The {nameof(Url)} field must contain a fully qualified URL, including protocol (e.g. http:// or https://)");
+                    }
+                }
+            }
+
+            /// <summary>
+            ///     Webhook HTTP header configuration.
+            /// </summary>
+            public class WebhookHttpHeader
+            {
+                /// <summary>
+                ///     Gets the name of the header.
+                /// </summary>
+                [NotNullOrWhiteSpace]
+                public string Name { get; init; }
+
+                /// <summary>
+                ///     Gets the header's value.
+                /// </summary>
+                public string Value { get; init; }
+            }
+
+            /// <summary>
+            ///     Retry configuration.
+            /// </summary>
+            public class RetryOptions
+            {
+                /// <summary>
+                ///     Gets the number of attempts to make before failing.
+                /// </summary>
+                [Range(1, int.MaxValue)]
+                public int Attempts { get; init; } = 1;
+            }
+
+            /// <summary>
+            ///     Script configuration.
+            /// </summary>
+            public class ScriptOptions
+            {
+                /// <summary>
+                ///     Gets the list of Event types that trigger the script.
+                /// </summary>
+                [Enum(typeof(EventType))]
+                public string[] On { get; init; } = Array.Empty<string>();
+
+                /// <summary>
+                ///     Gets the shell script to invoke.
+                /// </summary>
+                public ScriptRunOptions Run { get; init; } = new ScriptRunOptions();
+            }
+
+            /// <summary>
+            ///     Script run options.
+            /// </summary>
+            public class ScriptRunOptions : IValidatableObject
+            {
+                /// <summary>
+                ///     Gets the shell command to run.
+                /// </summary>
+                public string Command { get; init; }
+
+                /// <summary>
+                ///     Gets the executable to start.
+                /// </summary>
+                public string Executable { get; init; }
+
+                /// <summary>
+                ///     Gets the arguments to pass to the executable.
+                /// </summary>
+                /// <remarks>
+                ///     Mutually exclusive with <see cref="Arglist"/>.
+                /// </remarks>
+                public string Args { get; init; }
+
+                /// <summary>
+                ///     Gets the list of arguments to pass to the executable.
+                /// </summary>
+                /// <remarks>
+                ///     Mutually exclusive with <see cref="Args"/>.
+                /// </remarks>
+                public string[] Arglist { get; init; } = null;
+
+                public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+                {
+                    var cmdIsSet = !string.IsNullOrWhiteSpace(Command);
+                    var exeIsSet = !string.IsNullOrWhiteSpace(Executable);
+
+                    if ((cmdIsSet && exeIsSet) || (!cmdIsSet && !exeIsSet))
+                    {
+                        yield return new ValidationResult($"One and only one of the fields {nameof(Command)} or {nameof(Executable)} may be specified for a single script. If you intend to use the system shell, omit 'executable'. If you intend to use an executable other than the system shell, omit 'command' and specify either 'args' or 'args_list'.");
+                    }
+
+                    var argsIsSet = !string.IsNullOrWhiteSpace(Args);
+                    var argsListIsSet = Arglist is not null;
+
+                    if (argsIsSet && argsListIsSet)
+                    {
+                        yield return new ValidationResult($"Only one of the fields {nameof(Args)} or {nameof(Arglist)} may be specified for a single script. Specify 'args' if you intend to construct a single quoted string yourself, and specify 'args_list' if you'd like slskd to handle quoting for you.");
+                    }
+                }
+            }
 
             /// <summary>
             ///     FTP options.

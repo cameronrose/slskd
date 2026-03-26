@@ -42,6 +42,21 @@ namespace slskd
         }
 
         /// <summary>
+        ///     Redacts this instance of OptionsOverlay, replacing properties marked with <see cref="SecretAttribute"/> with '*****'.
+        /// </summary>
+        /// <remarks>
+        ///     Creates a deep clone before redacting.
+        /// </remarks>
+        /// <param name="options">The OptionsOverlay instance to redact.</param>
+        /// <returns>A redacted instance.</returns>
+        public static OptionsOverlay Redact(this OptionsOverlay options)
+        {
+            var redacted = options.ToJson().FromJson<OptionsOverlay>();
+            Redactor.Redact(redacted, redactWith: "*****");
+            return redacted;
+        }
+
+        /// <summary>
         ///     Creates a copy of this instance with the specified parameters changed.
         /// </summary>
         /// <param name="o">The options instance to copy.</param>
@@ -51,7 +66,7 @@ namespace slskd
         /// <param name="connectTimeout">The connection timeout, in milliseconds, for client and peer TCP connections.</param>
         /// <param name="inactivityTimeout">The inactivity timeout, in milliseconds, for peer TCP connections.</param>
         /// <param name="proxyOptions">Optional SOCKS 5 proxy configuration options.</param>
-        /// <param name="configureSocketAction">
+        /// <param name="configureSocket">
         ///     The delegate invoked during instantiation to configure the server Socket instance.
         /// </param>
         /// <returns>The new instance.</returns>
@@ -63,14 +78,14 @@ namespace slskd
             int? connectTimeout = null,
             int? inactivityTimeout = null,
             ProxyOptions proxyOptions = null,
-            Action<Socket> configureSocketAction = null) => new ConnectionOptions(
+            Action<Socket> configureSocket = null) => new ConnectionOptions(
                 readBufferSize: readBufferSize ?? o.ReadBufferSize,
                 writeBufferSize: writeBufferSize ?? o.WriteBufferSize,
                 writeQueueSize: writeQueueSize ?? o.WriteQueueSize,
                 connectTimeout: connectTimeout ?? o.ConnectTimeout,
                 inactivityTimeout: inactivityTimeout ?? o.InactivityTimeout,
                 proxyOptions: proxyOptions ?? o.ProxyOptions,
-                configureSocket: configureSocketAction ?? o.ConfigureSocket);
+                configureSocket: configureSocket ?? o.ConfigureSocket);
 
         /// <summary>
         ///     Creates a new instance of <see cref="UserStatisticsState"/> from this instance of <see cref="UserStatistics"/>.

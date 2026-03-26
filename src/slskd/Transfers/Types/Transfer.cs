@@ -25,15 +25,31 @@ namespace slskd.Transfers
 
     public class Transfer
     {
+        public Guid? BatchId { get; init; } = null;
+
         [Key]
         public Guid Id { get; init; }
         public string Username { get; init; }
         public TransferDirection Direction { get; init; }
+
+        /// <summary>
+        ///     Gets the remote filename.
+        /// </summary>
         public string Filename { get; init; }
         public long Size { get; set; }
         public long StartOffset { get; init; }
 
-        public TransferStates State { get; set; }
+        public TransferStates State { get; set; } = TransferStates.None;
+
+        /// <summary>
+        ///     Gets the string representation of the transfer <see cref="State"/>.
+        /// </summary>
+        /// <remarks>
+        ///     This is a hack to get the string into the database. *DO NOT* use this property in code
+        ///     and especially **DO NOT** set the value. The getter and setter can't be protected because
+        ///     EF Core needs them to be public.
+        /// </remarks>
+        public string StateDescription { get; set; }
         public DateTime RequestedAt { get; set; }
         public DateTime? EnqueuedAt { get; set; }
         public DateTime? StartedAt { get; set; }
@@ -50,6 +66,10 @@ namespace slskd.Transfers
 
         public int? PlaceInQueue { get; set; }
         public string Exception { get; set; }
+
+        public int Attempts { get; set; } = 0;
+
+        public DateTime? NextAttemptAt { get; set; } = null;
 
         [JsonIgnore]
         public bool Removed { get; set; }

@@ -22,6 +22,7 @@ namespace slskd.Core.API
     using Asp.Versioning;
     using Microsoft.AspNetCore.Authorization;
     using Microsoft.AspNetCore.Mvc;
+    using Serilog;
     using slskd.Authentication;
 
     /// <summary>
@@ -35,7 +36,7 @@ namespace slskd.Core.API
     public class SessionController : ControllerBase
     {
         public SessionController(
-            ISecurityService securityService,
+            SecurityService securityService,
             IOptionsSnapshot<Options> optionsSnapshot,
             OptionsAtStartup optionsAtStartup)
         {
@@ -46,7 +47,8 @@ namespace slskd.Core.API
 
         private IOptionsSnapshot<Options> OptionsSnapshot { get; set; }
         private OptionsAtStartup OptionsAtStartup { get; set; }
-        private ISecurityService Security { get; }
+        private SecurityService Security { get; }
+        private ILogger Log { get; } = Serilog.Log.ForContext<SessionController>();
 
         /// <summary>
         ///     Checks whether the provided authentication is valid.
@@ -96,6 +98,12 @@ namespace slskd.Core.API
         [ProducesResponseType(typeof(string), 500)]
         public IActionResult Login([FromBody] LoginRequest login)
         {
+            if (OptionsAtStartup.Headless)
+            {
+                Log.Warning("Login from {User} rejected; web UI is DISABLED when running in headless mode", login.Username);
+                return Forbid();
+            }
+
             if (login == default)
             {
                 return BadRequest();

@@ -50,6 +50,15 @@ namespace slskd.Transfers
         void Complete(string username, string filename);
 
         /// <summary>
+        ///     Gracefully attempts to signal the completion of an upload, returning false if a problem is encountered
+        ///     (such as the upload not being tracked currently).
+        /// </summary>
+        /// <param name="username">The username of the remote user.</param>
+        /// <param name="filename">The completed filename.</param>
+        /// <returns>A value indicating whether a problem was encountered.</returns>
+        bool TryComplete(string username, string filename);
+
+        /// <summary>
         ///     Enqueues an upload.
         /// </summary>
         /// <param name="username">The username of the remote user.</param>
@@ -152,8 +161,31 @@ namespace slskd.Transfers
         }
 
         /// <summary>
+        ///     Gracefully attempts to signal the completion of an upload, returning false if a problem is encountered
+        ///     (such as the upload not being tracked currently).
+        /// </summary>
+        /// <param name="username">The username of the remote user.</param>
+        /// <param name="filename">The completed filename.</param>
+        /// <returns>A value indicating whether a problem was encountered.</returns>
+        public bool TryComplete(string username, string filename)
+        {
+            try
+            {
+                Complete(username, filename);
+                return true;
+            }
+            catch (SlskdException)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         ///     Signals the completion of an upload.
         /// </summary>
+        /// <remarks>
+        ///     Will not throw on repeated attempts.
+        /// </remarks>
         /// <param name="username">The username of the remote user.</param>
         /// <param name="filename">The completed filename.</param>
         public void Complete(string username, string filename)
@@ -296,7 +328,7 @@ namespace slskd.Transfers
                 // ddddddd
                 //     ^
                 //
-                // if we want the postion of the file over the carat above, first find the position of it
+                // if we want the position of the file over the carat above, first find the position of it
                 // within its own queue (= 5). assume uploads will process top down, left to right until reaching
                 // this one.  that's 5 files from a, 2 from b, 5 from c, and the other 4 from d, putting the file over
                 // the carat at position 16. the actual number will vary due to many factors, including where in the
@@ -371,14 +403,14 @@ namespace slskd.Transfers
 
             try
             {
-                var optionsHash = Compute.Sha1Hash(options.Groups.ToJson());
+                var optionsHash = Compute.Sha1Hash(options.Transfers.Groups.ToJson());
 
-                if (optionsHash == LastOptionsHash && options.Global.Upload.Slots == LastGlobalSlots)
+                if (optionsHash == LastOptionsHash && options.Transfers.Upload.Slots == LastGlobalSlots)
                 {
                     return;
                 }
 
-                GlobalSlots = options.Global.Upload.Slots;
+                GlobalSlots = options.Transfers.Upload.Slots;
 
                 // statically add built-in groups
                 var groups = new List<UploadGroup>()
@@ -399,23 +431,23 @@ namespace slskd.Transfers
                     new UploadGroup()
                     {
                         Name = Application.DefaultGroup,
-                        Priority = options.Groups.Default.Upload.Priority,
-                        Slots = Math.Min(options.Groups.Default.Upload.Slots, GlobalSlots),
+                        Priority = options.Transfers.Groups.Default.Upload.Priority,
+                        Slots = Math.Min(options.Transfers.Groups.Default.Upload.Slots, GlobalSlots),
                         UsedSlots = GetExistingUsedSlotsOrDefault(Application.DefaultGroup),
-                        Strategy = options.Groups.Default.Upload.Strategy.ToEnum<QueueStrategy>(),
+                        Strategy = options.Transfers.Groups.Default.Upload.Strategy.ToEnum<QueueStrategy>(),
                     },
                     new UploadGroup()
                     {
                         Name = Application.LeecherGroup,
-                        Priority = options.Groups.Leechers.Upload.Priority,
-                        Slots = Math.Min(options.Groups.Leechers.Upload.Slots, GlobalSlots),
+                        Priority = options.Transfers.Groups.Leechers.Upload.Priority,
+                        Slots = Math.Min(options.Transfers.Groups.Leechers.Upload.Slots, GlobalSlots),
                         UsedSlots = GetExistingUsedSlotsOrDefault(Application.LeecherGroup),
-                        Strategy = options.Groups.Leechers.Upload.Strategy.ToEnum<QueueStrategy>(),
+                        Strategy = options.Transfers.Groups.Leechers.Upload.Strategy.ToEnum<QueueStrategy>(),
                     },
                 };
 
                 // dynamically add user-defined groups
-                groups.AddRange(options.Groups.UserDefined.Select(kvp => new UploadGroup()
+                groups.AddRange(options.Transfers.Groups.UserDefined.Select(kvp => new UploadGroup()
                 {
                     Name = kvp.Key,
                     Priority = kvp.Value.Upload.Priority,
@@ -426,7 +458,7 @@ namespace slskd.Transfers
 
                 Groups = groups.ToDictionary(g => g.Name);
 
-                LastGlobalSlots = options.Global.Upload.Slots;
+                LastGlobalSlots = options.Transfers.Upload.Slots;
                 LastOptionsHash = optionsHash;
             }
             finally

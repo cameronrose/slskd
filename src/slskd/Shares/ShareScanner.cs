@@ -29,6 +29,7 @@ namespace slskd.Shares
     using System.Threading.Channels;
     using System.Threading.Tasks;
     using Serilog;
+    using slskd.Files;
 
     /// <summary>
     ///     Shared file cache.
@@ -65,13 +66,16 @@ namespace slskd.Shares
         ///     Initializes a new instance of the <see cref="ShareScanner"/> class.
         /// </summary>
         /// <param name="workerCount"></param>
+        /// <param name="fileService"></param>
         /// <param name="soulseekFileFactory"></param>
         public ShareScanner(
             int workerCount,
+            FileService fileService,
             ISoulseekFileFactory soulseekFileFactory = null)
         {
             WorkerCount = workerCount;
-            SoulseekFileFactory = soulseekFileFactory ?? new SoulseekFileFactory();
+            Files = fileService;
+            SoulseekFileFactory = soulseekFileFactory ?? new SoulseekFileFactory(fileService: Files);
 
             Flags = Program.Flags;
         }
@@ -81,9 +85,10 @@ namespace slskd.Shares
         /// </summary>
         public IStateMonitor<SharedFileCacheState> StateMonitor => State;
 
+        private FileService Files { get; }
         private int WorkerCount { get; }
         private ILogger Log { get; } = Serilog.Log.ForContext<ShareScanner>();
-        private List<Share> Shares { get; set; }
+        private IReadOnlyList<Share> Shares { get; set; }
         private ISoulseekFileFactory SoulseekFileFactory { get; }
         private IManagedState<SharedFileCacheState> State { get; } = new ManagedState<SharedFileCacheState>();
         private SemaphoreSlim SyncRoot { get; } = new SemaphoreSlim(1);
@@ -156,6 +161,8 @@ namespace slskd.Shares
                 var swSnapshot = 0L;
                 sw.Start();
 
+                // note: this should be the only place where we are assigning Shares, so that this is 1) synchronized by SyncRoot
+                // and 2) stable throughout the scan.  if this ever changes we'll have to snapshot the value and use it instead
                 Shares = shares.ToList();
 
                 if (!Shares.Any())
@@ -163,7 +170,10 @@ namespace slskd.Shares
                     Log.Warning("Aborting shared file scan; no shares configured.");
                 }
 
-                Shares.ForEach(s => Log.Debug(s.ToJson()));
+                foreach (var share in Shares)
+                {
+                    Log.Debug(share.ToJson());
+                }
 
                 Shares.Where(s => !s.IsExcluded).ToList()
                     .ForEach(s => Log.Information("Sharing {Local} as {Remote}", s.LocalPath, s.RemotePath));
@@ -261,7 +271,7 @@ namespace slskd.Shares
                                 // qualified name the only time this *should* cause problems is if one of the shares is a subdirectory of another.
                                 foreach (var originalFilename in newFiles)
                                 {
-                                    var info = new FileInfo(originalFilename);
+                                    var info = Files.ResolveFileInfo(originalFilename);
                                     var file = SoulseekFileFactory.Create(originalFilename, maskedFilename: originalFilename.ReplaceFirst(share.LocalPath, share.RemotePath).NormalizePathForSoulseek());
 
                                     if (filters.Any(filter => filter.IsMatch(originalFilename)))

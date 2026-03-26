@@ -16,6 +16,7 @@
 // </copyright>
 
 using System.IO;
+using slskd.Files;
 
 namespace slskd.Shares
 {
@@ -48,6 +49,16 @@ namespace slskd.Shares
         private static readonly string[] VideoExtensions = { "mkv", "ogv", "avi", "wmv", "asf", "mp4", "m4p", "m4v", "mpg", "mpe", "mpv", "mpg", "m2v" };
         private static readonly HashSet<string> SupportedExtensions = AudioExtensions.Concat(VideoExtensions).ToHashSet();
 
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="SoulseekFileFactory"/> class.
+        /// </summary>
+        /// <param name="fileService"></param>
+        public SoulseekFileFactory(FileService fileService)
+        {
+            Files = fileService;
+        }
+
+        private FileService Files { get; }
         private ILogger Log { get; } = Serilog.Log.ForContext<SoulseekFileFactory>();
 
         /// <summary>
@@ -59,7 +70,7 @@ namespace slskd.Shares
         public File Create(string filename, string maskedFilename)
         {
             var code = 1;
-            var size = new FileInfo(filename).Length;
+            var size = Files.ResolveFileInfo(filename).Length;
             var extension = Path.GetExtension(filename).TrimStart('.').ToLowerInvariant();
             List<FileAttribute> attributeList = default;
 
@@ -72,7 +83,7 @@ namespace slskd.Shares
                 {
                     file = TagLib.File.Create(filename, TagLib.ReadStyle.Average | TagLib.ReadStyle.PictureLazy);
 
-                    // try to mimick the behavior of existing clients by providing attributes selectively and in a specific order,
+                    // try to mimic the behavior of existing clients by providing attributes selectively and in a specific order,
                     // depending on whether files use a lossless or lossy codec. lossless files should have BitsPerSample, while lossy
                     // will not. this may not be the best way to determine this.
                     bool isLossless = file.Properties.BitsPerSample > 0;

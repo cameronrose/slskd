@@ -40,11 +40,14 @@ namespace slskd
     using Serilog.Events;
     using slskd.Configuration;
     using slskd.Core.API;
+    using slskd.Events;
+    using slskd.Files;
     using slskd.Integrations.Pushbullet;
     using slskd.Messaging;
     using slskd.Relay;
     using slskd.Search;
     using slskd.Shares;
+    using slskd.Telemetry;
     using slskd.Transfers;
     using slskd.Users;
     using Soulseek;
@@ -80,23 +83,31 @@ namespace slskd
 
         private static readonly string ApplicationShutdownTransferExceptionMessage = "Application shut down";
 
+#pragma warning disable SA1306 // Field names should begin with lower-case letter
+        private static int EnqueueQueueDepth = 0;
+        private static double CurrentEnqueueLatency = 0;
+        private static int IncomingSearchRequestQueueDepth = 0;
+#pragma warning restore SA1306 // Field names should begin with lower-case letter
+
         public Application(
             OptionsAtStartup optionsAtStartup,
             IOptionsMonitor<Options> optionsMonitor,
             IManagedState<State> state,
             ISoulseekClient soulseekClient,
-            IConnectionWatchdog connectionWatchdog,
+            FileService fileService,
+            ConnectionWatchdog connectionWatchdog,
             ITransferService transferService,
             IBrowseTracker browseTracker,
-            IRoomTracker roomTracker,
             IRoomService roomService,
             IUserService userService,
             IMessagingService messagingService,
             IShareService shareService,
+            ISearchService searchService,
             IPushbulletService pushbulletService,
             IRelayService relayService,
             IHubContext<ApplicationHub> applicationHub,
-            IHubContext<LogsHub> logHub)
+            IHubContext<LogsHub> logHub,
+            EventBus eventBus)
         {
             Console.CancelKeyPress += (_, args) =>
             {
@@ -121,6 +132,12 @@ namespace slskd
             OptionsMonitor = optionsMonitor;
             OptionsMonitor.OnChange(async options => await OptionsMonitor_OnChange(options));
 
+            EventBus = eventBus;
+
+            IncomingSearchRequestSemaphore = new SemaphoreSlim(
+                initialCount: OptionsAtStartup.Throttling.Search.Incoming.Concurrency,
+                maxCount: OptionsAtStartup.Throttling.Search.Incoming.Concurrency);
+
             PreviousOptions = OptionsMonitor.CurrentValue;
 
             Flags = Program.Flags;
@@ -132,13 +149,20 @@ namespace slskd
                 regexOptions |= RegexOptions.IgnoreCase;
             }
 
-            CompiledSearchResponseFilters = OptionsAtStartup.Filters.Search.Request.Select(f => new Regex(f, regexOptions));
+            CompiledSearchRequestFilters = OptionsAtStartup.Filters.Search.Request
+                .Select(f => new Regex(f, regexOptions))
+                .ToList()
+                .AsReadOnly();
 
             State = state;
             State.OnChange(state => State_OnChange(state));
 
+            Files = fileService;
+
             Shares = shareService;
             Shares.StateMonitor.OnChange(state => ShareState_OnChange(state));
+
+            Search = searchService;
 
             Transfers = transferService;
             BrowseTracker = browseTracker;
@@ -164,28 +188,28 @@ namespace slskd
 
             Client.BrowseProgressUpdated += Client_BrowseProgressUpdated;
             Client.UserStatusChanged += Client_UserStatusChanged;
-            Client.PrivateMessageReceived += Client_PrivateMessageRecieved;
+            Client.PrivateMessageReceived += Client_PrivateMessageReceived;
 
             Client.PrivateRoomMembershipAdded += (e, room) => Log.Information("Added to private room {Room}", room);
             Client.PrivateRoomMembershipRemoved += (e, room) => Log.Information("Removed from private room {Room}", room);
             Client.PrivateRoomModerationAdded += (e, room) => Log.Information("Promoted to moderator in private room {Room}", room);
             Client.PrivateRoomModerationRemoved += (e, room) => Log.Information("Demoted from moderator in private room {Room}", room);
 
-            Client.PublicChatMessageReceived += Client_PublicChatMessageReceived;
             Client.RoomMessageReceived += Client_RoomMessageReceived;
             Client.Disconnected += Client_Disconnected;
             Client.Connected += Client_Connected;
             Client.LoggedIn += Client_LoggedIn;
             Client.StateChanged += Client_StateChanged;
             Client.DistributedNetworkStateChanged += Client_DistributedNetworkStateChanged;
-            Client.DownloadDenied += (e, args) => Log.Information("Download of {Filename} from {Username} was denied: {Message}", args.Filename, args.Username, args.Message);
-            Client.DownloadFailed += (e, args) => Log.Information("Download of {Filename} from {Username} failed", args.Filename, args.Username);
+            Client.DownloadDenied += (e, args) => Log.Error("Download of {Filename} from {Username} was denied by the remote user: {Message}", args.Filename, args.Username, args.Message);
+            Client.DownloadFailed += (e, args) => Log.Error("Download of {Filename} from {Username} reported as failed by the remote user", args.Filename, args.Username);
 
             Client.ExcludedSearchPhrasesReceived += Client_ExcludedSearchPhrasesReceived;
 
             ConnectionWatchdog = connectionWatchdog;
 
             Clock.EveryMinute += Clock_EveryMinute;
+            Clock.EveryThirtySeconds += Clock_EveryThirtySeconds;
             Clock.EveryFiveMinutes += Clock_EveryFiveMinutes;
             Clock.EveryThirtyMinutes += Clock_EveryThirtyMinutes;
             Clock.EveryHour += Clock_EveryHour;
@@ -199,9 +223,10 @@ namespace slskd
         private static bool ShuttingDown { get; set; } = false;
 
         private ISoulseekClient Client { get; set; }
+        private FileService Files { get; }
         private IRoomService RoomService { get; set; }
         private IBrowseTracker BrowseTracker { get; set; }
-        private IConnectionWatchdog ConnectionWatchdog { get; }
+        private ConnectionWatchdog ConnectionWatchdog { get; }
         private IMessagingService Messaging { get; set; }
         private ILogger Log { get; set; } = Serilog.Log.ForContext<Application>();
         private ConcurrentDictionary<string, ILogger> Loggers { get; } = new ConcurrentDictionary<string, ILogger>();
@@ -209,6 +234,9 @@ namespace slskd
         private OptionsAtStartup OptionsAtStartup { get; set; }
         private IOptionsMonitor<Options> OptionsMonitor { get; set; }
         private SemaphoreSlim OptionsSyncRoot { get; } = new SemaphoreSlim(1, 1);
+        private SemaphoreSlim GlobalEnqueueSemaphore { get; } = new SemaphoreSlim(10, 10);
+        private SemaphoreSlim UserEnqueueSemaphoreSyncRoot { get; } = new SemaphoreSlim(1, 1);
+        private ConcurrentDictionary<string, SemaphoreSlim> UserEnqueueSemaphores { get; } = new ConcurrentDictionary<string, SemaphoreSlim>();
         private Options PreviousOptions { get; set; }
         private IPushbulletService Pushbullet { get; }
         private DateTime SharesRefreshStarted { get; set; }
@@ -216,14 +244,17 @@ namespace slskd
         private ITransferService Transfers { get; init; }
         private IHubContext<ApplicationHub> ApplicationHub { get; set; }
         private IHubContext<LogsHub> LogHub { get; set; }
+        private EventBus EventBus { get; }
         private IUserService Users { get; set; }
         private IShareService Shares { get; set; }
+        private ISearchService Search { get; set; }
         private IRelayService Relay { get; set; }
         private IMemoryCache Cache { get; set; } = new MemoryCache(new MemoryCacheOptions());
-        private IEnumerable<Regex> CompiledSearchResponseFilters { get; set; }
-        private IEnumerable<Guid> ActiveDownloadIdsAtPreviousShutdown { get; set; } = Enumerable.Empty<Guid>();
+        private IReadOnlyList<Regex> CompiledSearchRequestFilters { get; set; } = [];
+        private IReadOnlyList<Guid> ActiveDownloadIdsAtPreviousShutdown { get; set; } = [];
         private Options.FlagsOptions Flags { get; set; }
-        private IReadOnlyCollection<string> ExcludedSearchPhrases { get; set; } = Enumerable.Empty<string>().ToList();
+        private IReadOnlyList<string> ExcludedSearchPhrases { get; set; } = [];
+        private SemaphoreSlim IncomingSearchRequestSemaphore { get; set; }
 
         public void CollectGarbage()
         {
@@ -293,38 +324,58 @@ namespace slskd
         {
             Log.Information("Application started");
 
+            Log.Debug("Cleaning up any dangling records");
+
             // if the application shut down "uncleanly", transfers may need to be cleaned up. we deliberately don't allow these
             // records to be updated if the application has started to shut down so that we can do this cleanup and properly
             // disposition them as having failed due to an application shutdown, instead of some random exception thrown while
             // things are being disposed.
-            var activeUploads = Transfers.Uploads.List(t => !t.State.HasFlag(TransferStates.Completed), includeRemoved: false)
-                .Where(t => !t.State.HasFlag(TransferStates.Completed)) // https://github.com/dotnet/efcore/issues/10434
-                .ToList();
+            var activeUploads = Transfers.Uploads.List(t => t.EndedAt == null || !TransferStateCategories.Completed.Contains(t.State), includeRemoved: true);
 
             foreach (var upload in activeUploads)
             {
                 Log.Debug("Cleaning up dangling upload {Filename} to {Username}", upload.Filename, upload.Username);
                 upload.State = TransferStates.Completed | TransferStates.Errored;
+                upload.EndedAt = DateTime.UtcNow;
                 upload.Exception = ApplicationShutdownTransferExceptionMessage;
                 Transfers.Uploads.Update(upload);
             }
 
-            var activeDownloads = Transfers.Downloads.List(t => !t.State.HasFlag(TransferStates.Completed) && !t.Removed)
-                .Where(t => !t.State.HasFlag(TransferStates.Completed)) // https://github.com/dotnet/efcore/issues/10434
-                .ToList();
+            var activeDownloads = Transfers.Downloads.List(t => t.EndedAt == null || !TransferStateCategories.Completed.Contains(t.State), includeRemoved: true);
 
             foreach (var download in activeDownloads)
             {
                 Log.Debug("Cleaning up dangling download {Filename} from {Username}", download.Filename, download.Username);
                 download.State = TransferStates.Completed | TransferStates.Errored;
+                download.EndedAt = DateTime.UtcNow;
                 download.Exception = ApplicationShutdownTransferExceptionMessage;
                 Transfers.Downloads.Update(download);
+            }
+
+            /*
+                search records can be left 'dangling' as well. responses are held in memory and saved to the database
+                when the search is complete, so when a search 'dangles' all responses have been lost. to avoid discrepancies,
+                we need to zero the response and file counts as well as set the state and EndedAt.
+            */
+            var activeSearches = await Search.ListAsync(s => s.EndedAt == null || !s.State.HasFlag(SearchStates.Completed));
+
+            foreach (var search in activeSearches)
+            {
+                Log.Debug("Cleaning up dangling search {Query} started {StartedAt}", search.SearchText, search.StartedAt);
+                search.Responses = [];
+                search.ResponseCount = 0;
+                search.FileCount = 0;
+                search.LockedFileCount = 0;
+                search.State = SearchStates.Completed | SearchStates.TimedOut;
+                search.EndedAt = DateTime.UtcNow;
+
+                Search.Update(search);
             }
 
             // save the ids of any downloads that were active, so we can re-enqueue them after we've connected and logged in.
             // we need to check the database before we re-request to make sure the user didn't remove them from the UI while
             // the application was running, but before it was logged in. so just save the ids.
-            ActiveDownloadIdsAtPreviousShutdown = activeDownloads.Select(d => d.Id);
+            ActiveDownloadIdsAtPreviousShutdown = activeDownloads.Select(d => d.Id).ToList().AsReadOnly();
             Log.Debug("Downloads to resume upon connection: {Ids}", ActiveDownloadIdsAtPreviousShutdown.ToJson());
 
             Log.Debug("Configuring client");
@@ -343,25 +394,24 @@ namespace slskd
             var connectionOptions = new ConnectionOptions(
                 readBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Read,
                 writeBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Write,
-                writeQueueSize: OptionsAtStartup.Soulseek.Connection.Buffer.WriteQueue,
+                writeQueueSize: int.MaxValue, // no write queue for peer, server or transfer connections
                 connectTimeout: OptionsAtStartup.Soulseek.Connection.Timeout.Connect,
                 inactivityTimeout: OptionsAtStartup.Soulseek.Connection.Timeout.Inactivity,
                 proxyOptions: proxyOptions);
 
-            var configureKeepAlive = new Action<Socket>(socket =>
-            {
-                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, OptionsAtStartup.Soulseek.Connection.Timeout.Inactivity / 1000);
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, OptionsAtStartup.Soulseek.Connection.Timeout.Inactivity / 1000);
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
-            });
+            // os-specific keepalive is configured for long-lived connections for the server and distributed parent/children
+            var serverOptions = connectionOptions.With(
+                inactivityTimeout: -1, // don't disconnect due to inactivity
+                configureSocket: socket => ConfigureSocketKeepaliveOptions(socket, OptionsAtStartup.Soulseek.Connection));
 
-            var serverOptions = connectionOptions.With(configureSocketAction: configureKeepAlive);
-            var distributedOptions = connectionOptions.With(configureSocketAction: configureKeepAlive);
+            var distributedOptions = connectionOptions.With(
+                writeQueueSize: OptionsAtStartup.Soulseek.Connection.Buffer.WriteQueue, // write queue set to keep distributed children from impacting performance
+                configureSocket: socket => ConfigureSocketKeepaliveOptions(socket, OptionsAtStartup.Soulseek.Connection));
 
             var transferOptions = connectionOptions.With(
                 readBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Transfer,
-                writeBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Transfer);
+                writeBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Transfer,
+                inactivityTimeout: OptionsAtStartup.Soulseek.Connection.Timeout.Transfer);
 
             var patch = new SoulseekClientOptionsPatch(
                 listenIPAddress: IPAddress.Parse(OptionsAtStartup.Soulseek.ListenIpAddress),
@@ -371,8 +421,8 @@ namespace slskd
                 distributedChildLimit: OptionsAtStartup.Soulseek.DistributedNetwork.ChildLimit,
                 enableDistributedNetwork: !OptionsAtStartup.Soulseek.DistributedNetwork.Disabled,
                 acceptDistributedChildren: !OptionsAtStartup.Soulseek.DistributedNetwork.DisableChildren,
-                maximumUploadSpeed: OptionsAtStartup.Global.Upload.SpeedLimit,
-                maximumDownloadSpeed: OptionsAtStartup.Global.Download.SpeedLimit,
+                maximumUploadSpeed: OptionsAtStartup.Transfers.Upload.SpeedLimit,
+                maximumDownloadSpeed: OptionsAtStartup.Transfers.Download.SpeedLimit,
                 autoAcknowledgePrivateMessages: false,
                 acceptPrivateRoomInvitations: true,
                 serverConnectionOptions: serverOptions,
@@ -453,13 +503,7 @@ namespace slskd
                 }
                 else
                 {
-                    var opt = OptionsAtStartup.Soulseek;
-
-                    await Client.ConnectAsync(
-                        address: opt.Address,
-                        port: opt.Port,
-                        username: opt.Username,
-                        password: opt.Password).ConfigureAwait(false);
+                    ConnectionWatchdog.Start();
                 }
             }
         }
@@ -477,214 +521,325 @@ namespace slskd
             return Task.CompletedTask;
         }
 
-        // todo: consider moving this somewhere else; it's pretty long and complicated
+        private void ConfigureSocketKeepaliveOptions(Socket socket, Options.SoulseekOptions.ConnectionOptions options)
+        {
+            /*
+                os-specific keepalive is configured for long-lived connections for the server and distributed parent/children
+                there may be legitimate reasons for these connections to go idle, and for that reason we can't use an inactivity watchdog
+                to determine when they are dead.
+
+                the intent, assuming the inactivity option is set to 15 seconds, is to send a keepalive probe after 15 seconds of inactivity,
+                and then again every 15 seconds until a total of 3 unanswered probes are sent, after which the socket will disconnect.
+            */
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+                if (OperatingSystem.IsWindows() && OptionsAtStartup.Flags.LegacyWindowsTcpKeepalive)
+                {
+                    return;
+                }
+
+                // the following will throw an exception on operating systems prior to Windows 10, version 1709 (and whatever Server SKU that corresponds to)
+                // see: https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-tcp-socket-options
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // TCP_KEEPCNT
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, options.Timeout.Inactivity / 1000); // TCP_KEEPIDLE
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, options.Timeout.Inactivity / 1000); // TCP_KEEPINTVL
+            }
+            catch (SocketException ex)
+            {
+                Log.Warning("Failed to configure connection keepalive settings: \"{Message}\". Performance is degraded. Set the configuration flag \"Legacy Windows TCP Keepalive\" to avoid this.", ex.Message);
+            }
+        }
+
         private async Task EnqueueDownload(string username, IPEndPoint endpoint, string filename)
         {
-            if (Users.IsBlacklisted(username, endpoint.Address))
+            Metrics.Enqueue.RequestsReceived.Inc(1);
+
+            /*
+                circuit breaker/failsafe:
+
+                if it would take longer than three minutes to process this request based on the number of waiting requests
+                and the average processing latency, reject the request automatically to alleviate pressure on the system.
+
+                the requesting client will almost certainly consider any file for which it hasn't gotten confirmation
+                in over a minute to be failed, over 3 minutes is a safety buffer.
+            */
+            if (EnqueueQueueDepth * CurrentEnqueueLatency > 180_000)
             {
-                Log.Information("Rejected enqueue request for blacklisted user {Username} ({IP})", username, endpoint.Address);
-                throw new DownloadEnqueueException("File not shared.");
+                Metrics.Enqueue.RequestsDropped.Inc(1);
+                throw new DownloadEnqueueException("Overwhelmed with requests; try again later.");
             }
 
-            // in order to properly determine if the requested file would exceed any limits, we need to know the size of the file
-            // it helps, too, that this will tell us whether the file is even shared.
-            (string Host, string Filename, long Size) resolved;
+            var stopwatch = new Stopwatch();
+            var decisionStopwatch = new Stopwatch();
+
+            SemaphoreSlim userSemaphore = null;
+            Task userSemaphoreWaitTask;
+            bool userSemaphoreAcquired = false;
+
+            bool enqueueRequestsSemaphoreAcquired = false;
 
             try
             {
-                resolved = await Shares.ResolveFileAsync(filename);
-            }
-            catch (NotFoundException)
-            {
-                throw new DownloadEnqueueException("File not shared.");
-            }
+                if (Users.IsBlacklisted(username, endpoint.Address))
+                {
+                    Log.Information("Rejected enqueue request for blacklisted user {Username} ({IP})", username, endpoint.Address);
+                    throw new DownloadEnqueueException("File not shared.");
+                }
 
-            // get the user's group. this will be the name of the user's group, if they have been added to a
-            // user defined group, or one of the built-ins; 'default', 'privileged', 'leecher', or 'blacklisted'
-            var group = await Users.GetOrFetchGroupAsync(username);
+                /*
+                    for limits to work properly (and to help alleviate strain from the db, make incoming requests 'fair' among competing users),
+                    we need to ensure that we process only one request per user at a time.
 
-            // privileged users aren't subject to limits (for now)
-            // i'm putting this off because 1) limits are unique to slskd, so all other clients are "unlimited"
-            // and 2) i can't figure out what the limits would be, if not unlimited. users should get some level
-            // of control, but i'd need to figure out a lower bound
-            if (string.Equals(group, PrivilegedGroup))
-            {
-                Log.Debug("Limits bypassed for {Username} and {File}; user is privileged", username, filename);
+                    it's important that we obtain the user semaphore FIRST (before the global semaphore) to prevent one user
+                    from monopolizing the request queue; users must 'go to the back of the line' for each request
+
+                    hopefully this process takes < 10ms on most systems, but on low-spec systems with high traffic, this
+                    round-robin approach helps guarantee the best QoS for peers
+                */
+                Interlocked.Increment(ref EnqueueQueueDepth); // any request waiting on any semaphore counts
+
+                try
+                {
+                    // obtain exclusive access over the user dictionary. if this blocks it'll only be for a few ns
+                    // we should also only be holding it for a few ns per request
+                    await UserEnqueueSemaphoreSyncRoot.WaitAsync();
+
+                    try
+                    {
+                        // get the user's semaphore and START waiting; if we wait we'll tie up the sync root
+                        userSemaphore = UserEnqueueSemaphores.GetOrAdd(username, new SemaphoreSlim(initialCount: 1, maxCount: 1));
+                        userSemaphoreWaitTask = userSemaphore.WaitAsync();
+                    }
+                    finally
+                    {
+                        UserEnqueueSemaphoreSyncRoot.Release();
+                    }
+
+                    await userSemaphoreWaitTask;
+                    userSemaphoreAcquired = true;
+
+                    await GlobalEnqueueSemaphore.WaitAsync();
+                    enqueueRequestsSemaphoreAcquired = true;
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref EnqueueQueueDepth);
+                    Metrics.Enqueue.CurrentQueueDepth.Set(EnqueueQueueDepth);
+                }
+
+                stopwatch.Start();
+
+                // in order to properly determine if the requested file would exceed any limits, we need to know the size of the file
+                // it helps, too, that this will tell us whether the file is even shared.
+                (string Host, string Filename, long Size) resolved;
+
+                try
+                {
+                    resolved = await Shares.ResolveFileAsync(filename);
+                }
+                catch (NotFoundException)
+                {
+                    throw new DownloadEnqueueException("File not shared.");
+                }
+
+                // get the user's group. this will be the name of the user's group, if they have been added to a
+                // user defined group, or one of the built-ins; 'default', 'privileged', 'leecher', or 'blacklisted'
+                var group = await Users.GetOrFetchGroupAsync(username);
+
+                // privileged users aren't subject to limits (for now)
+                // i'm putting this off because 1) limits are unique to slskd, so all other clients are "unlimited"
+                // and 2) i can't figure out what the limits would be, if not unlimited. users should get some level
+                // of control, but i'd need to figure out a lower bound
+                if (string.Equals(group, PrivilegedGroup))
+                {
+                    Log.Debug("Limits bypassed for {Username} and {File}; user is privileged", username, filename);
+                    await Transfers.Uploads.EnqueueAsync(username, filename);
+                    return;
+                }
+
+                // we'll fall back to global limits for any limit that isn't set at the group level
+                var global = Options.Transfers.Upload.Limits;
+
+                // resolve the limits for this user's group.
+                Options.TransfersOptions.LimitsOptions limits;
+
+                if (Options.Transfers.Groups.UserDefined.TryGetValue(group, out var userDefinedOptions))
+                {
+                    limits = userDefinedOptions.Upload.Limits;
+                }
+                else
+                {
+                    limits = group switch
+                    {
+                        DefaultGroup => Options.Transfers.Groups.Default.Upload.Limits,
+                        LeecherGroup => Options.Transfers.Groups.Leechers.Upload.Limits,
+                        _ => Options.Transfers.Groups.Default.Upload.Limits, // that's weird! we'll just go with defaults..
+                    };
+                }
+
+                bool IsNull(Options.TransfersOptions.LimitsOptions.Limits lim, Options.TransfersOptions.LimitsOptions.Limits global)
+                    => (lim is null && global is null) || ((lim?.Files ?? global?.Files ?? lim?.Megabytes ?? global?.Megabytes ?? lim.Failures ?? global.Failures) is null);
+
+                /*
+                 * we have limits set, so now we have to fetch the data and compare to see if any would be hit if we allow this transfer to be enqueued.
+                 * the strategy here is to summarize all uploads:
+                 * 1) belonging to this user
+                 * 2) that were started within the time period
+                 * 3) that did not end due to an error (state includes errored, exception column is set)
+                */
+                (bool Files, bool Megabytes) OverLimits(
+                    int files,
+                    long bytes,
+                    Options.TransfersOptions.LimitsOptions.Limits options,
+                    Options.TransfersOptions.LimitsOptions.Limits defaults,
+                    long size)
+                {
+                    var filesOver = false;
+                    var megabytesOver = false;
+                    var byteLimitInMegabytes = options?.Megabytes ?? defaults?.Megabytes;
+
+                    if (byteLimitInMegabytes is not null && (bytes + size) > (byteLimitInMegabytes * 1000L * 1000L))
+                    {
+                        Log.Debug("Projected bytes {Bytes} exceeds limit {Limit}", bytes + size, byteLimitInMegabytes * 1000L * 1000L);
+                        megabytesOver = true;
+                    }
+
+                    var fileLimit = options?.Files ?? defaults?.Files;
+
+                    if (fileLimit is not null && (files + 1) > fileLimit)
+                    {
+                        Log.Debug("Projected file count {Files} exceeds limit {Limit}", files + 1, fileLimit);
+                        filesOver = true;
+                    }
+
+                    return (filesOver, megabytesOver);
+                }
+
+                decisionStopwatch.Start();
+
+                var stats = Transfers.Uploads.GetUserStatistics(username, DateTime.UtcNow);
+
+                // start with the queue, since that should contain the fewest files and should be the least expensive to check
+                // "queued" includes both queued and in progress; records with a null EndedAt property, which is guaranteed to be set
+                // for terminal transfers.
+                if (!IsNull(limits?.Queued, global?.Queued))
+                {
+                    var over = OverLimits(
+                        files: stats.QueuedFiles,
+                        bytes: stats.QueuedBytes,
+                        options: limits?.Queued,
+                        defaults: global?.Queued,
+                        size: resolved.Size);
+
+                    if (over.Files || over.Megabytes)
+                    {
+                        Log.Information("Rejected enqueue request for user {Username}: Queued limits exceeded", username);
+
+                        // note: return exactly 'Too many files' or 'Too many megabytes' to ensure interop with other clients.
+                        // these messages are retryable, while anything else is not
+                        throw new DownloadEnqueueException($"Too many {(over.Megabytes ? "megabytes" : "files")}");
+                    }
+                }
+
+                // start with weekly, as this is the most likely limit to be hit and we want to keep the work to a minimum
+                // transfers that 'count' for the weekly limit are uploads that:
+                // * started within the last week
+                // * which have or have not ended (assuming queued files will complete)
+                // * that were not errored
+                if (!IsNull(limits?.Weekly, global?.Weekly))
+                {
+                    var failureLimit = limits?.Weekly?.Failures ?? global?.Weekly?.Failures;
+
+                    if (failureLimit is not null && stats.WeeklyFailedFiles >= failureLimit)
+                    {
+                        Log.Information("Rejected enqueue request for user {Username}: Weekly failure limit met or exceeded", username);
+                        throw new DownloadEnqueueException("Too many failed transfers this week");
+                    }
+
+                    var over = OverLimits(
+                        files: stats.WeeklySucceededFiles,
+                        bytes: stats.WeeklySucceededBytes,
+                        options: limits?.Weekly,
+                        defaults: global?.Weekly,
+                        size: resolved.Size);
+
+                    if (over.Files || over.Megabytes)
+                    {
+                        Log.Information("Rejected enqueue request for user {Username}: Weekly limits exceeded", username);
+                        throw new DownloadEnqueueException($"Too many {(over.Files ? "files" : "megabytes")} this week");
+                    }
+                }
+
+                // lastly, check daily limits. the criteria for this is the same as weekly, just looking over the previous day instead
+                // of the previous 7.
+                if (!IsNull(limits?.Daily, global?.Daily))
+                {
+                    var failureLimit = limits?.Daily?.Failures ?? global?.Daily?.Failures;
+
+                    if (failureLimit is not null && stats.DailyFailedFiles >= failureLimit)
+                    {
+                        Log.Information("Rejected enqueue request for user {Username}: Daily failure limit met or exceeded", username);
+                        throw new DownloadEnqueueException("Too many failed transfers today");
+                    }
+
+                    var over = OverLimits(
+                        files: stats.DailySucceededFiles,
+                        bytes: stats.DailySucceededBytes,
+                        options: limits?.Daily,
+                        defaults: global?.Daily,
+                        size: resolved.Size);
+
+                    if (over.Files || over.Megabytes)
+                    {
+                        Log.Information("Rejected enqueue request for user {Username}: Daily limits exceeded", username);
+                        throw new DownloadEnqueueException($"Too many {(over.Files ? "files" : "megabytes")} today");
+                    }
+                }
+
+                decisionStopwatch.Stop();
+
                 await Transfers.Uploads.EnqueueAsync(username, filename);
-                return;
+
+                stopwatch.Stop();
+
+                // we only report metrics for successes so that each value is guaranteed to include the enqueue latency
+                Metrics.Enqueue.RequestsAccepted.Inc(1);
+                Metrics.Enqueue.Latency.Observe(stopwatch.ElapsedMilliseconds);
+                Metrics.Enqueue.CurrentLatency.Update(stopwatch.ElapsedMilliseconds);
+
+                Interlocked.Exchange(ref CurrentEnqueueLatency, Metrics.Enqueue.CurrentLatency.Value);
+
+                Log.Information("Enqueue of {Filename} to {Username} completed in {ElapsedOverall}ms, decision made in {ElapsedDecision}ms", filename, username, stopwatch.ElapsedMilliseconds, decisionStopwatch.ElapsedMilliseconds);
             }
-
-            // we'll fall back to global limits for any limit that isn't set at the group level
-            var global = Options.Global.Limits;
-
-            // resolve the limits for this user's group.
-            Options.LimitsOptions limits;
-
-            if (Options.Groups.UserDefined.TryGetValue(group, out var userDefinedOptions))
+            catch (DownloadEnqueueException)
             {
-                limits = userDefinedOptions.Limits;
+                Metrics.Enqueue.RequestsRejected.Inc(1);
+                throw;
             }
-            else
+            finally
             {
-                limits = group switch
+                if (decisionStopwatch.IsRunning)
                 {
-                    DefaultGroup => Options.Groups.Default.Limits,
-                    LeecherGroup => Options.Groups.Leechers.Limits,
-                    _ => Options.Groups.Default.Limits, // that's weird! we'll just go with defaults..
-                };
-            }
-
-            bool IsNull(Options.LimitsOptions.Limits lim, Options.LimitsOptions.Limits global)
-                => (lim is null && global is null) || ((lim?.Files ?? global?.Files ?? lim?.Megabytes ?? global?.Megabytes ?? lim.Failures ?? global.Failures) is null);
-
-            /*
-             * we have limits set, so now we have to fetch the data and compare to see if any would be hit if we allow this transfer to be enqueued.
-             * the strategy here is to summarize all uploads:
-             * 1) belonging to this user
-             * 2) that were started within the time period
-             * 3) that did not end due to an error (state includes errored, exception column is set)
-            */
-            (bool Files, bool Megabytes) OverLimits(
-                (int Files, long Bytes) stats,
-                Options.LimitsOptions.Limits options,
-                Options.LimitsOptions.Limits defaults,
-                long size)
-            {
-                var files = false;
-                var megabytes = false;
-                var byteLimit = options?.Megabytes ?? defaults?.Megabytes;
-
-                if (byteLimit is not null && (stats.Bytes + size) > (byteLimit * 1000 * 1000))
-                {
-                    Log.Debug("Projected bytes {Bytes} exceeds limit {Limit}", stats.Bytes + size, byteLimit * 1000 * 1000);
-                    megabytes = true;
+                    decisionStopwatch.Stop();
                 }
 
-                var fileLimit = options?.Files ?? defaults?.Files;
+                // decision latency is reported here so that we can track both successes and failures; they do the same
+                // work so lumping them together gives us the clearest picture
+                Metrics.Enqueue.DecisionLatency.Observe(decisionStopwatch.ElapsedMilliseconds);
+                Metrics.Enqueue.CurrentDecisionLatency.Update(decisionStopwatch.ElapsedMilliseconds);
 
-                if (fileLimit is not null && (stats.Files + 1) > fileLimit)
+                if (userSemaphoreAcquired)
                 {
-                    Log.Debug("Projected file count {Files} exceeds limit {Limit}", stats.Files + 1, fileLimit);
-                    files = true;
+                    userSemaphore.Release();
                 }
 
-                return (files, megabytes);
-            }
-
-            var sw = new Stopwatch();
-            sw.Start();
-
-            // start with the queue, since that should contain the fewest files and should be the least expensive to check
-            // "queued" includes both queued and in progress; records with a null EndedAt property, which is guaranteed to be set
-            // for terminal transfers.
-            if (!IsNull(limits?.Queued, global?.Queued))
-            {
-                var queued = Transfers.Uploads.Summarize(
-                    expression: t => t.Username == username && t.EndedAt == null);
-
-                Log.Debug("Fetched queue stats: files: {Files}, bytes: {Bytes} ({Time}ms)", queued.Files, queued.Bytes, sw.ElapsedMilliseconds);
-
-                var over = OverLimits(queued, limits?.Queued, global?.Queued, resolved.Size);
-
-                if (over.Files || over.Megabytes)
+                if (enqueueRequestsSemaphoreAcquired)
                 {
-                    Log.Information("Rejected enqueue request for user {Username}: Queued limits exceeded", username);
-
-                    // note: return exactly 'Too many files' or 'Too many megabytes' to ensure interop with other clients.
-                    // these messages are retryable, while anything else is not
-                    throw new DownloadEnqueueException($"Too many {(over.Megabytes ? "megabytes" : "files")}");
+                    GlobalEnqueueSemaphore.Release();
                 }
             }
-
-            // start with weekly, as this is the most likely limit to be hit and we want to keep the work to a minimum
-            // transfers that 'count' for the weekly limit are uploads that:
-            // * started within the last week
-            // * which have or have not ended (assuming queued files will complete)
-            // * that were not errored
-            if (!IsNull(limits?.Weekly, global?.Weekly))
-            {
-                var erroredState = TransferStates.Completed | TransferStates.Errored;
-                var cutoffDateTime = DateTime.UtcNow.AddDays(-7);
-
-                var failures = Transfers.Uploads.Summarize(
-                    expression: t =>
-                        t.Username == username
-                        && t.StartedAt >= cutoffDateTime
-                        && (t.State.HasFlag(erroredState) || t.Exception != null));
-
-                Log.Debug("Fetched weekly failures: {Failures} ({Time}ms)", failures.Files, sw.ElapsedMilliseconds);
-
-                var failureLimit = limits?.Weekly?.Failures ?? global?.Weekly?.Failures;
-
-                if (failureLimit is not null && failures.Files >= failureLimit)
-                {
-                    Log.Information("Rejected enqueue request for user {Username}: Weekly failure limit met or exceeded", username);
-                    throw new DownloadEnqueueException("Too many failed transfers this week");
-                }
-
-                var weekly = Transfers.Uploads.Summarize(
-                    expression: t =>
-                        t.Username == username
-                        && t.StartedAt >= cutoffDateTime
-                        && !t.State.HasFlag(erroredState)
-                        && t.Exception == null);
-
-                Log.Debug("Fetched weekly stats: files: {Files}, bytes: {Bytes} ({Time}ms)", weekly.Files, weekly.Bytes, sw.ElapsedMilliseconds);
-
-                var over = OverLimits(weekly, limits?.Weekly, global?.Weekly, resolved.Size);
-
-                if (over.Files || over.Megabytes)
-                {
-                    Log.Information("Rejected enqueue request for user {Username}: Weekly limits exceeded", username);
-                    throw new DownloadEnqueueException($"Too many {(over.Files ? "files" : "megabytes")} this week");
-                }
-            }
-
-            // lastly, check daily limits. the criteria for this is the same as weekly, just looking over the previous day instead
-            // of the previous 7.
-            if (!IsNull(limits?.Daily, global?.Daily))
-            {
-                var erroredState = TransferStates.Completed | TransferStates.Errored;
-                var cutoffDateTime = DateTime.UtcNow.AddDays(-1);
-
-                var failures = Transfers.Uploads.Summarize(
-                    expression: t =>
-                        t.Username == username
-                        && t.StartedAt >= cutoffDateTime
-                        && (t.State.HasFlag(erroredState) || t.Exception != null));
-
-                Log.Debug("Fetched daily failures: {Failures} ({Time}ms)", failures.Files, sw.ElapsedMilliseconds);
-
-                var failureLimit = limits?.Daily?.Failures ?? global?.Daily?.Failures;
-
-                if (failureLimit is not null && failures.Files >= failureLimit)
-                {
-                    Log.Information("Rejected enqueue request for user {Username}: Daily failure limit met or exceeded", username);
-                    throw new DownloadEnqueueException("Too many failed transfers today");
-                }
-
-                var daily = Transfers.Uploads.Summarize(
-                    expression: t =>
-                        t.Username == username
-                        && t.StartedAt >= cutoffDateTime
-                        && !t.State.HasFlag(erroredState)
-                        && t.Exception == null);
-
-                Log.Debug("Fetched daily stats: files: {Files}, bytes: {Bytes} ({Time}ms)", daily.Files, daily.Bytes, sw.ElapsedMilliseconds);
-
-                var over = OverLimits(daily, limits?.Daily, global?.Daily, resolved.Size);
-
-                if (over.Files || over.Megabytes)
-                {
-                    Log.Information("Rejected enqueue request for user {Username}: Daily limits exceeded", username);
-                    throw new DownloadEnqueueException($"Too many {(over.Files ? "files" : "megabytes")} today");
-                }
-            }
-
-            sw.Stop();
-            Log.Debug("Enqueue decision made in {Duration}ms", sw.ElapsedMilliseconds);
-
-            await Transfers.Uploads.EnqueueAsync(username, filename);
         }
 
         /// <summary>
@@ -711,7 +866,7 @@ namespace slskd
                 BrowseResponse response = default;
 
                 var cacheFilename = Path.Combine(Program.DataDirectory, "browse.cache");
-                var cacheFileInfo = new FileInfo(cacheFilename);
+                var cacheFileInfo = Files.ResolveFileInfo(cacheFilename);
 
                 if (!cacheFileInfo.Exists)
                 {
@@ -750,14 +905,17 @@ namespace slskd
         {
             ConnectionWatchdog.Stop();
             Log.Information("Connected to the Soulseek server");
+
+            EventBus.Raise(new SoulseekClientConnectedEvent());
         }
 
         private void Client_DiagnosticGenerated(object sender, DiagnosticEventArgs args)
         {
             static LogEventLevel TranslateLogLevel(DiagnosticLevel diagnosticLevel) => diagnosticLevel switch
             {
+                DiagnosticLevel.Trace => LogEventLevel.Verbose,
                 DiagnosticLevel.Debug => LogEventLevel.Debug,
-                DiagnosticLevel.Info => LogEventLevel.Debug,
+                DiagnosticLevel.Info => LogEventLevel.Information,
                 DiagnosticLevel.Warning => LogEventLevel.Warning,
                 DiagnosticLevel.None => default,
                 _ => default,
@@ -771,6 +929,12 @@ namespace slskd
             }
 
             var logger = Loggers.GetOrAdd(source, Log.ForContext("Context", "Soulseek").ForContext("SubContext", source));
+
+            if (args.IncludesException && OptionsAtStartup.Debug)
+            {
+                logger.Write(TranslateLogLevel(args.Level), exception: args.Exception, "{@Message}", args.Message);
+                return;
+            }
 
             logger.Write(TranslateLogLevel(args.Level), "{@Message}", args.Message);
         }
@@ -798,11 +962,22 @@ namespace slskd
             {
                 Log.Error("Disconnected from the Soulseek server: another client logged in using the same username");
             }
+            else if (args.Exception is VPNClientException)
+            {
+                Log.Error("Disconnected from the Soulseek server; VPN is required and the VPN client has gone down");
+                ConnectionWatchdog.Start();
+            }
             else
             {
                 Log.Error("Disconnected from the Soulseek server: {Message}", args.Exception?.Message ?? args.Message);
                 ConnectionWatchdog.Start();
             }
+
+            EventBus.Raise(new SoulseekClientDisconnectedEvent()
+            {
+                Message = args.Message,
+                Exception = args.Exception,
+            });
         }
 
         private async Task RefreshUserStatistics(bool force = false)
@@ -845,13 +1020,13 @@ namespace slskd
                 // we previously saved a list of all of the download ids that were active at the previous shutdown; fetch the latest
                 // record for those transfers from the db and ensure they haven't been removed from the UI while the application was offline
                 // the user doesn't want those transfers anymore and we don't want to add them back.
-                var resumeableDownloads = Transfers.Downloads.List(t => !t.Removed && ActiveDownloadIdsAtPreviousShutdown.Contains(t.Id));
+                var resumableDownloads = Transfers.Downloads.List(t => !t.Removed && ActiveDownloadIdsAtPreviousShutdown.Contains(t.Id));
 
-                if (resumeableDownloads.Any())
+                if (resumableDownloads.Any())
                 {
                     Log.Information("Attempting to re-enqueue previously active downloads...");
 
-                    var groups = resumeableDownloads.GroupBy(d => d.Username);
+                    var groups = resumableDownloads.GroupBy(d => d.Username);
 
                     // re-request downloads. we use a try/catch here because there's a very good chance that the other user is offline.
                     foreach (var group in groups)
@@ -871,7 +1046,7 @@ namespace slskd
                 }
 
                 // clear the ids we saved at startup; we don't want to re-request these again if the connection is cycled
-                ActiveDownloadIdsAtPreviousShutdown = Enumerable.Empty<Guid>();
+                ActiveDownloadIdsAtPreviousShutdown = [];
             }
             catch (Exception ex)
             {
@@ -879,31 +1054,39 @@ namespace slskd
             }
         }
 
-        private void Client_PrivateMessageRecieved(object sender, PrivateMessageReceivedEventArgs args)
+        private void Client_PrivateMessageReceived(object sender, PrivateMessageReceivedEventArgs args)
         {
+            if (Users.IsBlacklisted(args.Username))
+            {
+                Log.Debug("Ignored private message from blacklisted user {Username}: {Message}", args.Username, args.Message);
+                return;
+            }
+            else
+            {
+                // todo: raise blacklisted message event?
+            }
+
             Messaging.Conversations.HandleMessageAsync(args.Username, PrivateMessage.FromEventArgs(args));
 
-            if (Options.Integration.Pushbullet.Enabled && !args.Replayed)
+            if (Options.Integrations.Pushbullet.Enabled && !args.Replayed)
             {
                 _ = Pushbullet.PushAsync($"Private Message from {args.Username}", args.Username, args.Message);
             }
         }
 
-        private void Client_PublicChatMessageReceived(object sender, PublicChatMessageReceivedEventArgs args)
-        {
-            Log.Information("[Public Chat/{Room}] [{Username}]: {Message}", args.RoomName, args.Username, args.Message);
-
-            if (Options.Integration.Pushbullet.Enabled && args.Message.Contains(Client.Username))
-            {
-                _ = Pushbullet.PushAsync($"Room Mention by {args.Username} in {args.RoomName}", args.RoomName, args.Message);
-            }
-        }
-
         private void Client_RoomMessageReceived(object sender, RoomMessageReceivedEventArgs args)
         {
+            // note: this event is also subscribed in the RoomService class
+            // this handler is only used for pushbullet.
+            // todo: refactor pushbullet so that it uses events
+            if (Users.IsBlacklisted(args.Username))
+            {
+                return;
+            }
+
             var message = RoomMessage.FromEventArgs(args, DateTime.UtcNow);
 
-            if (Options.Integration.Pushbullet.Enabled && message.Message.Contains(Client.Username))
+            if (Options.Integrations.Pushbullet.Enabled && message.Message.Contains(Client.Username))
             {
                 _ = Pushbullet.PushAsync($"Room Mention by {message.Username} in {message.RoomName}", message.RoomName, message.Message);
             }
@@ -915,8 +1098,8 @@ namespace slskd
             {
                 Server = state.Server with
                 {
-                    Address = Client.Address,
-                    IPEndPoint = Client.IPEndPoint,
+                    Address = Client.State.HasFlag(SoulseekClientStates.Disconnected) ? null : Client.Address,
+                    IPEndPoint = Client.State.HasFlag(SoulseekClientStates.Disconnected) ? default : Client.IPEndPoint,
                     State = Client.State,
                 },
                 User = state.User with
@@ -953,10 +1136,33 @@ namespace slskd
         {
             Metrics.DistributedNetwork.BroadcastLatency.Observe(Client.DistributedNetwork.AverageBroadcastLatency ?? 0);
             Metrics.DistributedNetwork.CurrentBroadcastLatency.Set(Client.DistributedNetwork.AverageBroadcastLatency ?? 0);
+
+            _ = Task.Run(() => CleanupUserEnqueueSemaphoresAsync())
+                .ContinueWith(task => Log.Error(task.Exception, "Failed to clean up user enqueue semaphore(s): {Message}", task.Exception?.Message), TaskContinuationOptions.OnlyOnFaulted);
+        }
+
+        private void Clock_EveryThirtySeconds(object sender, ClockEventArgs e)
+        {
+            State.SetValue(state => state with
+            {
+                Health = state.Health with
+                {
+                    Search = state.Health.Search with
+                    {
+                        Incoming = state.Health.Search.Incoming with
+                        {
+                            Latency = Metrics.Search.Incoming.CurrentResponseLatency.Value,
+                            QueueDepth = IncomingSearchRequestQueueDepth,
+                            DropRate = Metrics.Search.Incoming.CurrentRequestDropRate.Count,
+                        },
+                    },
+                },
+            });
         }
 
         private void Clock_EveryFiveMinutes(object sender, ClockEventArgs e)
         {
+            _ = Task.Run(() => PruneSearches());
             _ = Task.Run(() => PruneTransfers());
         }
 
@@ -1028,7 +1234,7 @@ namespace slskd
                     };
 
                     var files = System.IO.Directory.GetFiles(directory, "*", options)
-                        .Select(filename => new FileInfo(filename))
+                        .Select(filename => Files.ResolveFileInfo(filename))
                         .Where(file => file.LastAccessTimeUtc <= DateTime.UtcNow.AddMinutes(-age.Value));
 
                     Log.Debug("Found {Count} files of need of pruning", files.Count());
@@ -1064,19 +1270,19 @@ namespace slskd
         {
             var options = OptionsMonitor.CurrentValue.Retention;
 
-            void PruneUpload(int? age, TransferStates state)
+            void PruneUpload(int? age, params TransferStates[] states)
             {
                 if (age.HasValue)
                 {
-                    Transfers.Uploads.Prune(age.Value, TransferStates.Completed | state);
+                    Transfers.Uploads.Prune(age.Value, [.. states.Select(s => TransferStates.Completed | s)]);
                 }
             }
 
-            void PruneDownload(int? age, TransferStates state)
+            void PruneDownload(int? age, params TransferStates[] states)
             {
                 if (age.HasValue)
                 {
-                    Transfers.Downloads.Prune(age.Value, TransferStates.Completed | state);
+                    Transfers.Downloads.Prune(age.Value, [.. states.Select(s => TransferStates.Completed | s)]);
                 }
             }
 
@@ -1084,11 +1290,13 @@ namespace slskd
             {
                 PruneUpload(options.Transfers.Upload.Succeeded, TransferStates.Succeeded);
                 PruneUpload(options.Transfers.Upload.Cancelled, TransferStates.Cancelled);
-                PruneUpload(options.Transfers.Upload.Errored, TransferStates.Errored);
+                PruneUpload(options.Transfers.Upload.Errored, TransferStates.Errored, TransferStates.Aborted, TransferStates.Rejected, TransferStates.TimedOut);
+                PruneUpload(options.Transfers.Upload.Failed, [.. TransferStateCategories.Failed]);
 
                 PruneDownload(options.Transfers.Download.Succeeded, TransferStates.Succeeded);
                 PruneDownload(options.Transfers.Download.Cancelled, TransferStates.Cancelled);
-                PruneDownload(options.Transfers.Download.Errored, TransferStates.Errored);
+                PruneDownload(options.Transfers.Download.Errored, TransferStates.Errored, TransferStates.Aborted, TransferStates.TimedOut);
+                PruneDownload(options.Transfers.Download.Failed, [.. TransferStateCategories.Failed]);
             }
             catch
             {
@@ -1096,10 +1304,27 @@ namespace slskd
             }
         }
 
+        private async Task PruneSearches()
+        {
+            var age = OptionsMonitor.CurrentValue.Retention.Search;
+
+            if (age.HasValue)
+            {
+                try
+                {
+                    var pruned = await Search.PruneAsync(age.Value);
+                }
+                catch
+                {
+                    Log.Error("Encountered one or more errors while pruning searches");
+                }
+            }
+        }
+
         private void Client_ExcludedSearchPhrasesReceived(object sender, IReadOnlyCollection<string> e)
         {
             Log.Debug("Excluded search phrases: {Phrases}", string.Join(", ", e));
-            ExcludedSearchPhrases = e;
+            ExcludedSearchPhrases = e.ToList();
         }
 
         private void Client_TransferProgressUpdated(object sender, TransferProgressUpdatedEventArgs args)
@@ -1164,18 +1389,18 @@ namespace slskd
         /// <param name="token">The unique token for the request, supplied by the requesting user.</param>
         /// <param name="directory">The requested directory.</param>
         /// <returns>A Task resolving an instance of Soulseek.Directory containing the contents of the requested directory.</returns>
-        private async Task<Soulseek.Directory> DirectoryContentsResponseResolver(string username, IPEndPoint endpoint, int token, string directory)
+        private async Task<IEnumerable<Soulseek.Directory>> DirectoryContentsResponseResolver(string username, IPEndPoint endpoint, int token, string directory)
         {
             if (Users.IsBlacklisted(username, endpoint.Address))
             {
                 Log.Information("Returned empty directory listing for blacklisted user {Username} ({IP})", username, endpoint.Address);
-                return new Soulseek.Directory(directory);
+                return [new Soulseek.Directory(directory)];
             }
 
             try
             {
                 var dir = await Shares.ListDirectoryAsync(directory);
-                return dir;
+                return [dir];
             }
             catch (Exception ex)
             {
@@ -1191,6 +1416,8 @@ namespace slskd
             // shenanigans here could lead to missed updates.
             await OptionsSyncRoot.WaitAsync();
 
+            Log.Debug("OptionsMonitor OnChange Invoked");
+
             try
             {
                 var pendingRestart = false;
@@ -1202,8 +1429,11 @@ namespace slskd
                 // don't react to duplicate/no-change events https://github.com/slskd/slskd/issues/126
                 if (!diff.Any())
                 {
+                    Log.Debug("Diff of previous and new options is the same; nothing to do");
                     return;
                 }
+
+                Log.Debug("Diff of previous and new options contains {Count} changed properties: {Properties}", diff.Count(), diff.Select(p => p.FQN));
 
                 foreach (var (property, fqn, left, right) in diff)
                 {
@@ -1235,7 +1465,11 @@ namespace slskd
                 if (PreviousOptions.Filters.Search.Request.Except(newOptions.Filters.Search.Request).Any()
                     || newOptions.Filters.Search.Request.Except(PreviousOptions.Filters.Search.Request).Any())
                 {
-                    CompiledSearchResponseFilters = newOptions.Filters.Search.Request.Select(f => new Regex(f, RegexOptions.Compiled));
+                    CompiledSearchRequestFilters = newOptions.Filters.Search.Request
+                        .Select(f => new Regex(f, RegexOptions.Compiled))
+                        .ToList()
+                        .AsReadOnly();
+
                     Log.Information("Updated and re-compiled search response filters");
                 }
 
@@ -1248,9 +1482,12 @@ namespace slskd
 
                 // determine whether any Soulseek options changed. if so, we need to construct a patch and invoke ReconfigureOptionsAsync().
                 var slskDiff = PreviousOptions.Soulseek.DiffWith(newOptions.Soulseek);
-                var globalDiff = PreviousOptions.Global.DiffWith(newOptions.Global);
 
-                if (slskDiff.Any() || globalDiff.Any())
+                // determine whether any global upload or download options changed
+                var transfersUploadDiff = PreviousOptions.Transfers.Upload.DiffWith(newOptions.Transfers.Upload);
+                var transfersDownloadDiff = PreviousOptions.Transfers.Download.DiffWith(newOptions.Transfers.Download);
+
+                if (slskDiff.Any() || transfersUploadDiff.Any() || transfersDownloadDiff.Any())
                 {
                     var old = PreviousOptions.Soulseek;
                     var update = newOptions.Soulseek;
@@ -1290,20 +1527,18 @@ namespace slskd
                             inactivityTimeout: connection.Timeout.Inactivity,
                             proxyOptions: proxyPatch);
 
-                        var configureKeepAlive = new Action<Socket>(socket =>
-                        {
-                            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, connection.Timeout.Inactivity / 1000);
-                            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, connection.Timeout.Inactivity / 1000);
-                            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
-                        });
+                        serverPatch = connectionPatch.With(
+                            inactivityTimeout: -1, // don't disconnect due to inactivity
+                            configureSocket: socket => ConfigureSocketKeepaliveOptions(socket, options: connection));
 
-                        serverPatch = connectionPatch.With(configureSocketAction: configureKeepAlive);
-                        distributedPatch = connectionPatch.With(configureSocketAction: configureKeepAlive);
+                        distributedPatch = connectionPatch.With(
+                            writeQueueSize: connection.Buffer.WriteQueue, // write queue set to keep distributed children from impacting performance
+                            configureSocket: socket => ConfigureSocketKeepaliveOptions(socket, options: connection));
 
                         transferPatch = connectionPatch.With(
                             readBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Transfer,
-                            writeBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Transfer);
+                            writeBufferSize: OptionsAtStartup.Soulseek.Connection.Buffer.Transfer,
+                            inactivityTimeout: connection.Timeout.Transfer);
                     }
 
                     var patch = new SoulseekClientOptionsPatch(
@@ -1312,8 +1547,8 @@ namespace slskd
                         enableDistributedNetwork: old.DistributedNetwork.Disabled == update.DistributedNetwork.Disabled ? null : !update.DistributedNetwork.Disabled,
                         distributedChildLimit: old.DistributedNetwork.ChildLimit == update.DistributedNetwork.ChildLimit ? null : update.DistributedNetwork.ChildLimit,
                         acceptDistributedChildren: old.DistributedNetwork.DisableChildren == update.DistributedNetwork.DisableChildren ? null : !update.DistributedNetwork.DisableChildren,
-                        maximumUploadSpeed: newOptions.Global.Upload.SpeedLimit,
-                        maximumDownloadSpeed: newOptions.Global.Download.SpeedLimit,
+                        maximumUploadSpeed: newOptions.Transfers.Upload.SpeedLimit,
+                        maximumDownloadSpeed: newOptions.Transfers.Download.SpeedLimit,
                         serverConnectionOptions: serverPatch,
                         peerConnectionOptions: connectionPatch,
                         transferConnectionOptions: transferPatch,
@@ -1361,23 +1596,39 @@ namespace slskd
         /// <returns>A Task resolving a SearchResponse, or null.</returns>
         private async Task<SearchResponse> SearchResponseResolver(string username, int token, SearchQuery query)
         {
-            Metrics.Search.RequestsReceived.Inc(1);
+            Metrics.Search.Incoming.RequestsReceived.Inc(1);
+            Metrics.Search.Incoming.CurrentRequestReceiveRate.CountUp(1);
 
-            if (Users.IsBlacklisted(username))
+            /*
+                if the host is struggling to process incoming search results in a timely manner, requests will back up
+                behind the SearchResponseSemaphore, potentially infinitely until the application runs out of memory and
+                crashes.
+
+                to prevent this from happening we must count the number of waiting requests in SearchResponseQueueDepth,
+                and if that count exceeds the configured CircuitBreaker, we drop the search request and don't attempt
+                to resolve a response.
+
+                search requests arrive very consistently at a rate of about 30 per second, so we have about ~33 milliseconds
+                to process each request on average before we get into trouble.
+            */
+            if (IncomingSearchRequestQueueDepth > OptionsMonitor.CurrentValue.Throttling.Search.Incoming.CircuitBreaker)
             {
+                Metrics.Search.Incoming.RequestsDropped.Inc(1);
+                Metrics.Search.Incoming.CurrentRequestDropRate.CountUp(1);
+
                 return null;
             }
 
-            if (CompiledSearchResponseFilters.Any(filter => filter.IsMatch(query.SearchText)))
-            {
-                return null;
-            }
+            Interlocked.Increment(ref IncomingSearchRequestQueueDepth);
 
-            // sometimes clients send search queries consisting only of exclusions; drop them.
-            // no other clients send search results for these, even though it is technically possible.
-            if (query.Terms.Count == 0)
+            try
             {
-                return null;
+                await IncomingSearchRequestSemaphore.WaitAsync();
+            }
+            finally
+            {
+                Interlocked.Decrement(ref IncomingSearchRequestQueueDepth);
+                Metrics.Search.Incoming.CurrentRequestQueueDepth.Set(IncomingSearchRequestQueueDepth);
             }
 
             try
@@ -1385,60 +1636,105 @@ namespace slskd
                 var sw = new Stopwatch();
                 sw.Start();
 
-                // append the list of excluded search phrases supplied by the server
-                // see https://github.com/jpdillingham/Soulseek.NET/issues/803
-                var queryWithExclusionsApplied = new SearchQuery(terms: query.Terms, exclusions: query.Exclusions.Concat(ExcludedSearchPhrases).Distinct());
-
-                var results = await Shares.SearchAsync(queryWithExclusionsApplied);
-
-                sw.Stop();
-
-                Metrics.Search.ResponseLatency.Observe(sw.ElapsedMilliseconds);
-                Metrics.Search.CurrentResponseLatency.Update(sw.ElapsedMilliseconds);
-
-                if (results.Any())
+                if (Users.IsBlacklisted(username))
                 {
-                    // fetch the user's IP address so that we can check whether it's blacklisted.
-                    // it's unfortunate that we have to do this to get the IP, but we have to do it
-                    // anyway to send the results, and the information is cached. whether we do it here
-                    // or Soulseek.NET does it under the hood doesn't really matter.
-                    var endpoint = await Client.GetUserEndPointAsync(username);
-
-                    if (Users.IsBlacklisted(username, endpoint.Address))
-                    {
-                        return null;
-                    }
-
-                    // make sure our average speed (as reported by the server) is reasonably up to date
-                    // we do this because we send the information along with the search response
-                    await RefreshUserStatistics();
-
-                    // note: the following uses cached user data to determine group, so if the user's data
-                    // isn't cached they may get a forecast based on the wrong group.  this is a hot path though,
-                    // and we don't want to incur the massive penalties that would caching data for each request.
-                    var forecastedPosition = Transfers.Uploads.Queue.ForecastPosition(username);
-
-                    Log.Information("[{Context}]: Sending {Count} records to {Username} for query '{Query}'", "SEARCH RESULT SENT", results.Count(), username, query.SearchText);
-
-                    Metrics.Search.ResponsesSent.Inc(1);
-
-                    return new SearchResponse(
-                        Client.Username,
-                        token,
-                        uploadSpeed: State.CurrentValue.User.Statistics.AverageSpeed,
-                        hasFreeUploadSlot: forecastedPosition == 0,
-                        queueLength: forecastedPosition,
-                        fileList: results);
+                    return null;
                 }
 
-                // if no results, either return null or an instance of SearchResponse with a fileList of length 0 in either case, no
-                // response will be sent to the requestor.
-                return null;
+                if (CompiledSearchRequestFilters.Any(filter => filter.IsMatch(query.SearchText)))
+                {
+                    return null;
+                }
+
+                // sometimes clients send search queries consisting only of exclusions; drop them.
+                // no other clients send search results for these, even though it is technically possible.
+                if (query.Terms.Count == 0)
+                {
+                    return null;
+                }
+
+                var filterLatency = sw.ElapsedMilliseconds;
+                Metrics.Search.Incoming.Filter.Latency.Observe(filterLatency);
+                Metrics.Search.Incoming.Filter.CurrentLatency.Update(filterLatency);
+
+                try
+                {
+                    // append the list of excluded search phrases supplied by the server
+                    // see https://github.com/jpdillingham/Soulseek.NET/issues/803
+                    var queryWithExclusionsApplied = new SearchQuery(terms: query.Terms, exclusions: query.Exclusions.Concat(ExcludedSearchPhrases).Distinct());
+
+                    var results = await Shares.SearchAsync(queryWithExclusionsApplied, limit: OptionsMonitor.CurrentValue.Throttling.Search.Incoming.ResponseFileLimit);
+
+                    var queryLatency = sw.ElapsedMilliseconds - filterLatency;
+                    Metrics.Search.Incoming.Query.Latency.Observe(queryLatency);
+                    Metrics.Search.Incoming.Query.CurrentLatency.Update(queryLatency);
+
+                    SearchResponse response = null;
+
+                    if (results.Any())
+                    {
+                        // fetch the user's IP address so that we can check whether it's blacklisted.
+                        // it's unfortunate that we have to do this to get the IP, but we have to do it
+                        // anyway to send the results, and the information is cached. whether we do it here
+                        // or Soulseek.NET does it under the hood doesn't really matter.
+                        try
+                        {
+                            var endpoint = await Client.GetUserEndPointAsync(username);
+
+                            if (Users.IsBlacklisted(username, endpoint.Address))
+                            {
+                                return null;
+                            }
+                        }
+                        catch (Soulseek.UserOfflineException)
+                        {
+                            return null;
+                        }
+
+                        // make sure our average speed (as reported by the server) is reasonably up to date
+                        // we do this because we send the information along with the search response
+                        await RefreshUserStatistics();
+
+                        // note: the following uses cached user data to determine group, so if the user's data
+                        // isn't cached they may get a forecast based on the wrong group.  this is a hot path though,
+                        // and we don't want to incur the massive penalties that would caching data for each request.
+                        var forecastedPosition = Transfers.Uploads.Queue.ForecastPosition(username);
+
+                        Log.Debug("Sending search response with {Count} files to {Username} for query '{Query}'", results.Count(), username, query.SearchText);
+
+                        response = new SearchResponse(
+                            Client.Username,
+                            token,
+                            uploadSpeed: State.CurrentValue.User.Statistics.AverageSpeed,
+                            hasFreeUploadSlot: forecastedPosition == 0,
+                            queueLength: forecastedPosition,
+                            fileList: results);
+                    }
+
+                    sw.Stop();
+
+                    Metrics.Search.Incoming.ResponseLatency.Observe(sw.ElapsedMilliseconds);
+                    Metrics.Search.Incoming.CurrentResponseLatency.Update(sw.ElapsedMilliseconds);
+
+                    if (response is not null)
+                    {
+                        Metrics.Search.Incoming.ResponsesSent.Inc(1);
+                        Metrics.Search.Incoming.CurrentResponseSendRate.CountUp(1);
+                    }
+
+                    // if no results, either return null or an instance of SearchResponse with a fileList of length 0 in either case, no
+                    // response will be sent to the requestor.
+                    return response;
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Failed to resolve search response: {Message}", ex.Message);
+                    throw;
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                Log.Warning(ex, "Failed to resolve search response: {Message}", ex.Message);
-                throw;
+                IncomingSearchRequestSemaphore.Release();
             }
         }
 
@@ -1576,13 +1872,32 @@ namespace slskd
         /// <returns>A Task resolving the UserInfo instance.</returns>
         private async Task<UserInfo> UserInfoResolver(string username, IPEndPoint endpoint)
         {
+            byte[] pictureBytes = null;
+
+            if (!string.IsNullOrWhiteSpace(Options.Soulseek.Picture))
+            {
+                try
+                {
+                    // note: the Picture setting is validated at startup to ensure it exists and that
+                    // it is readable
+                    pictureBytes = await System.IO.File.ReadAllBytesAsync(Options.Soulseek.Picture);
+                }
+                catch (Exception ex)
+                {
+                    // this isn't a serious enough problem to prevent us from continuing, so we'll just
+                    // log a warning and continue, omitting the picture
+                    Log.Warning("Failed to read Soulseek picture {Picture}: {Message}", Options.Soulseek.Picture, ex.Message);
+                }
+            }
+
             if (Users.IsBlacklisted(username, endpoint.Address))
             {
                 return new UserInfo(
                     description: Options.Soulseek.Description,
                     uploadSlots: 0,
                     queueLength: int.MaxValue,
-                    hasFreeUploadSlot: false);
+                    hasFreeUploadSlot: false,
+                    picture: pictureBytes);
             }
 
             try
@@ -1602,11 +1917,13 @@ namespace slskd
                 // i want to know how many slots they have, which gives me an idea of how fast their
                 // queue moves, and the length of the queue *ahead of me*, meaning how long i'd have to
                 // wait until my first download starts.
+                // revisited 3 years later: why was it important to leave this comment??
                 var info = new UserInfo(
                     description: Options.Soulseek.Description,
                     uploadSlots: group.Slots,
                     queueLength: forecastedPosition,
-                    hasFreeUploadSlot: forecastedPosition == 0);
+                    hasFreeUploadSlot: forecastedPosition == 0,
+                    picture: pictureBytes);
 
                 return info;
             }
@@ -1614,6 +1931,32 @@ namespace slskd
             {
                 Log.Warning(ex, "Failed to resolve user info: {Message}", ex.Message);
                 throw;
+            }
+        }
+
+        private async Task CleanupUserEnqueueSemaphoresAsync()
+        {
+            // don't wait if we can't get exclusive access immediately; we'll get it eventually
+            if (await UserEnqueueSemaphoreSyncRoot.WaitAsync(0).ConfigureAwait(false))
+            {
+                try
+                {
+                    foreach (var kvp in UserEnqueueSemaphores)
+                    {
+                        // if we're able to obtain the semaphore immediately, there's nothing waiting on it
+                        // and we're safe to dispose of it.  the sync root saves us from concurrency issues here
+                        if (await kvp.Value.WaitAsync(0).ConfigureAwait(false))
+                        {
+                            UserEnqueueSemaphores.TryRemove(kvp.Key, out var removed);
+                            removed.Dispose();
+                            Log.Debug($"Cleaned up enqueue semaphore for user {kvp.Key}");
+                        }
+                    }
+                }
+                finally
+                {
+                    UserEnqueueSemaphoreSyncRoot.Release();
+                }
             }
         }
     }

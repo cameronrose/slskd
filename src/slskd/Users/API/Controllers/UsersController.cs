@@ -26,6 +26,8 @@ namespace slskd.Users.API
     using Asp.Versioning;
     using Microsoft.AspNetCore.Authorization;
     using Microsoft.AspNetCore.Mvc;
+    using Serilog;
+
     using Soulseek;
 
     /// <summary>
@@ -57,6 +59,7 @@ namespace slskd.Users.API
         private ISoulseekClient Client { get; }
         private IUserService Users { get; }
         private IOptionsSnapshot<Options> OptionsSnapshot { get; }
+        private ILogger Log { get; set; } = Serilog.Log.ForContext<UsersController>();
 
         /// <summary>
         ///     Retrieves the address of the specified <paramref name="username"/>.
@@ -68,7 +71,7 @@ namespace slskd.Users.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(typeof(IPEndPoint), 200)]
         [ProducesResponseType(404)]
-        public async Task<IActionResult> Endpoint([FromRoute, Required] string username)
+        public async Task<IActionResult> Endpoint([FromRoute, UrlEncoded, Required] string username)
         {
             if (Program.IsRelayAgent)
             {
@@ -95,7 +98,7 @@ namespace slskd.Users.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(typeof(IEnumerable<Directory>), 200)]
         [ProducesResponseType(404)]
-        public async Task<IActionResult> Browse([FromRoute, Required] string username)
+        public async Task<IActionResult> Browse([FromRoute, UrlEncoded, Required] string username)
         {
             if (Program.IsRelayAgent)
             {
@@ -129,7 +132,7 @@ namespace slskd.Users.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(typeof(decimal), 200)]
         [ProducesResponseType(404)]
-        public IActionResult BrowseStatus([FromRoute, Required] string username)
+        public IActionResult BrowseStatus([FromRoute, UrlEncoded, Required] string username)
         {
             if (Program.IsRelayAgent)
             {
@@ -152,9 +155,9 @@ namespace slskd.Users.API
         /// <returns></returns>
         [HttpPost("{username}/directory")]
         [Authorize(Policy = AuthPolicy.Any)]
-        [ProducesResponseType(typeof(Directory), 200)]
+        [ProducesResponseType(typeof(IEnumerable<Directory>), 200)]
         [ProducesResponseType(404)]
-        public async Task<IActionResult> Directory([FromRoute, Required] string username, [FromBody, Required] DirectoryContentsRequest request)
+        public async Task<IActionResult> Directory([FromRoute, UrlEncoded, Required] string username, [FromBody, Required] DirectoryContentsRequest request)
         {
             if (Program.IsRelayAgent)
             {
@@ -169,6 +172,9 @@ namespace slskd.Users.API
             try
             {
                 var result = await Client.GetDirectoryContentsAsync(username, request.Directory);
+
+                Log.Debug("{Endpoint} response from {User} for directory '{Directory}': {@Response}", nameof(Directory), username, request.Directory, result);
+
                 return Ok(result);
             }
             catch (UserOfflineException ex)
@@ -186,7 +192,7 @@ namespace slskd.Users.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(typeof(Info), 200)]
         [ProducesResponseType(404)]
-        public async Task<IActionResult> Info([FromRoute, Required] string username)
+        public async Task<IActionResult> Info([FromRoute, UrlEncoded, Required] string username)
         {
             if (Program.IsRelayAgent)
             {
@@ -213,7 +219,7 @@ namespace slskd.Users.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(typeof(Status), 200)]
         [ProducesResponseType(404)]
-        public async Task<IActionResult> Status([FromRoute, Required] string username)
+        public async Task<IActionResult> Status([FromRoute, UrlEncoded, Required] string username)
         {
             if (Program.IsRelayAgent)
             {

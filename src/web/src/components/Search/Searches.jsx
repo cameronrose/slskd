@@ -7,12 +7,7 @@ import PlaceholderSegment from '../Shared/PlaceholderSegment';
 import SearchDetail from './Detail/SearchDetail';
 import SearchList from './List/SearchList';
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  useHistory,
-  useLocation,
-  useParams,
-  useRouteMatch,
-} from 'react-router-dom';
+import { useHistory, useParams, useRouteMatch } from 'react-router-dom';
 import { toast } from 'react-toastify';
 import { Button, Icon, Input, Segment } from 'semantic-ui-react';
 import { v4 as uuidv4 } from 'uuid';
@@ -30,7 +25,6 @@ const Searches = ({ server } = {}) => {
 
   const { id: searchId } = useParams();
   const history = useHistory();
-  const location = useLocation();
   const match = useRouteMatch();
 
   const onConnecting = () => {
@@ -52,11 +46,66 @@ const Searches = ({ server } = {}) => {
     onConnected();
   };
 
+  useEffect(() => {
+    onConnecting();
+
+    const searchHub = createSearchHubConnection();
+
+    searchHub.on('list', (searchesEvent) => {
+      onUpdate(
+        searchesEvent.reduce((accumulator, search) => {
+          accumulator[search.id] = search;
+          return accumulator;
+        }, {}),
+      );
+      onConnected();
+    });
+
+    searchHub.on('update', (search) => {
+      onUpdate((old) => ({ ...old, [search.id]: search }));
+    });
+
+    searchHub.on('delete', (search) => {
+      onUpdate((old) => {
+        delete old[search.id];
+        return { ...old };
+      });
+    });
+
+    searchHub.on('create', (search) => {
+      onUpdate((old) => ({ ...old, [search.id]: search }));
+    });
+
+    searchHub.onreconnecting((connectionError) =>
+      onConnectionError(connectionError?.message ?? 'Disconnected'),
+    );
+    searchHub.onreconnected(() => onConnected());
+    searchHub.onclose((connectionError) =>
+      onConnectionError(connectionError?.message ?? 'Disconnected'),
+    );
+
+    const connect = async () => {
+      try {
+        onConnecting();
+        await searchHub.start();
+      } catch (connectionError) {
+        toast.error(connectionError?.message ?? 'Failed to connect');
+        onConnectionError(connectionError?.message ?? 'Failed to connect');
+      }
+    };
+
+    connect();
+
+    return () => {
+      searchHub.stop();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // create a new search, and optionally navigate to it to display the details
   // we do this if the user clicks the search icon, or repeats an existing search
   const create = async ({ navigate = false, search } = {}) => {
     const ref = inputRef?.current?.inputRef?.current;
-    const searchText = search || ref?.value;
+    const searchText = search || ref.value;
     const id = uuidv4();
 
     try {
@@ -119,66 +168,6 @@ const Searches = ({ server } = {}) => {
       setStopping(false);
     }
   };
-
-  useEffect(() => {
-    onConnecting();
-
-    const searchHub = createSearchHubConnection();
-
-    searchHub.on('list', (searchesEvent) => {
-      onUpdate(
-        searchesEvent.reduce((accumulator, search) => {
-          accumulator[search.id] = search;
-          return accumulator;
-        }, {}),
-      );
-      onConnected();
-    });
-
-    searchHub.on('update', (search) => {
-      onUpdate((old) => ({ ...old, [search.id]: search }));
-    });
-
-    searchHub.on('delete', (search) => {
-      onUpdate((old) => {
-        delete old[search.id];
-        return { ...old };
-      });
-    });
-
-    searchHub.on('create', () => {});
-
-    searchHub.onreconnecting((connectionError) =>
-      onConnectionError(connectionError?.message ?? 'Disconnected'),
-    );
-    searchHub.onreconnected(() => onConnected());
-    searchHub.onclose((connectionError) =>
-      onConnectionError(connectionError?.message ?? 'Disconnected'),
-    );
-
-    const connect = async () => {
-      try {
-        onConnecting();
-        await searchHub.start();
-      } catch (connectionError) {
-        toast.error(connectionError?.message ?? 'Failed to connect');
-        onConnectionError(connectionError?.message ?? 'Failed to connect');
-      }
-    };
-
-    connect();
-
-    const searchText = new URLSearchParams(location.search).get('searchText');
-    if (searchText && searchText !== '') {
-      searchText.replace('–', '');
-      searchText.replace('  ', ' ');
-      create({ navigate: true, search: searchText });
-    }
-
-    return () => {
-      searchHub.stop();
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (connecting) {
     return <LoaderSegment />;

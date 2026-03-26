@@ -26,6 +26,7 @@ namespace slskd
     using System.IO;
     using System.Linq;
     using System.Net;
+    using System.Net.Http;
     using System.Reflection;
     using System.Security.Cryptography.X509Certificates;
     using System.Text;
@@ -39,7 +40,7 @@ namespace slskd
     using Microsoft.AspNetCore.Diagnostics;
     using Microsoft.AspNetCore.Hosting;
     using Microsoft.AspNetCore.Http;
-    using Microsoft.AspNetCore.Mvc.ApiExplorer;
+    using Microsoft.AspNetCore.Server.Kestrel.Core;
     using Microsoft.EntityFrameworkCore;
     using Microsoft.Extensions.Configuration;
     using Microsoft.Extensions.DependencyInjection;
@@ -52,18 +53,24 @@ namespace slskd
     using Serilog;
     using Serilog.Events;
     using Serilog.Sinks.Grafana.Loki;
+    using Serilog.Sinks.SystemConsole.Themes;
     using slskd.Authentication;
     using slskd.Configuration;
     using slskd.Core.API;
     using slskd.Cryptography;
+    using slskd.Events;
     using slskd.Files;
     using slskd.Integrations.FTP;
     using slskd.Integrations.Pushbullet;
+    using slskd.Integrations.Scripts;
+    using slskd.Integrations.VPN;
+    using slskd.Integrations.Webhooks;
     using slskd.Messaging;
     using slskd.Relay;
     using slskd.Search;
     using slskd.Search.API;
     using slskd.Shares;
+    using slskd.Telemetry;
     using slskd.Transfers;
     using slskd.Transfers.Downloads;
     using slskd.Transfers.Uploads;
@@ -83,6 +90,11 @@ namespace slskd
         ///     The name of the application.
         /// </summary>
         public static readonly string AppName = "slskd";
+
+        /// <summary>
+        ///     The DateTime of the 'genesis' of the application (the initial commit).
+        /// </summary>
+        public static readonly DateTime GenesisDateTime = new(2020, 12, 30, 6, 22, 0, DateTimeKind.Utc);
 
         /// <summary>
         ///     The name of the local share host.
@@ -145,6 +157,14 @@ namespace slskd
         public static string FullVersion { get; } = $"{SemanticVersion} ({InformationalVersion})";
 
         /// <summary>
+        ///     Gets the minor version to identify slskd on the network.
+        /// </summary>
+        /// <remarks>
+        ///     NOTICE: If you have forked slskd, change this number to something else.
+        /// </remarks>
+        public static int NetworkMinorVersion { get; } = 760;
+
+        /// <summary>
         ///     Gets a value indicating whether the current version is a Canary build.
         /// </summary>
         public static bool IsCanary { get; } = AssemblyVersion.Revision == 65534;
@@ -179,9 +199,19 @@ namespace slskd
         public static string ConfigurationFile { get; private set; } = null;
 
         /// <summary>
+        ///     Gets the current configuration overlay, if one has been applied.
+        /// </summary>
+        public static OptionsOverlay ConfigurationOverlay => VolatileOverlayConfigurationSource?.CurrentValue;
+
+        /// <summary>
         ///     Gets the path where persistent data is saved.
         /// </summary>
         public static string DataDirectory { get; private set; } = null;
+
+        /// <summary>
+        ///     Gets the path where backups of persistent data saved.
+        /// </summary>
+        public static string DataBackupDirectory { get; private set; } = null;
 
         /// <summary>
         ///     Gets the default fully qualified path to the configuration file.
@@ -204,6 +234,11 @@ namespace slskd
         public static string LogDirectory { get; private set; } = null;
 
         /// <summary>
+        ///     Gets the path where user-defined scripts are stored.
+        /// </summary>
+        public static string ScriptDirectory { get; private set; } = null;
+
+        /// <summary>
         ///     Gets a buffer containing the last few log events.
         /// </summary>
         public static ConcurrentFixedSizeQueue<LogRecord> LogBuffer { get; } = new ConcurrentFixedSizeQueue<LogRecord>(size: 100);
@@ -221,7 +256,9 @@ namespace slskd
         private static IConfigurationRoot Configuration { get; set; }
         private static OptionsAtStartup OptionsAtStartup { get; } = new OptionsAtStartup();
         private static ILogger Log { get; set; } = new ConsoleWriteLineLogger();
-        private static Mutex Mutex { get; } = new Mutex(initiallyOwned: true, Compute.Sha256Hash(AppName));
+        private static Mutex Mutex { get; set; }
+        private static IDisposable DotNetRuntimeStats { get; set; }
+        private static VolatileOverlayConfigurationSource<OptionsOverlay> VolatileOverlayConfigurationSource { get; set; } = new VolatileOverlayConfigurationSource<OptionsOverlay>();
 
         [Argument('g', "generate-cert", "generate X509 certificate and password for HTTPs")]
         private static bool GenerateCertificate { get; set; }
@@ -240,6 +277,18 @@ namespace slskd
 
         [Argument('v', "version", "display version information")]
         private static bool ShowVersion { get; set; }
+
+        /// <summary>
+        ///     Panic.
+        /// </summary>
+        /// <param name="code">An optional exit code.</param>
+        public static void Exit(int code = 1) => Environment.Exit(code);
+
+        /// <summary>
+        ///     Apply an instance of <see cref="OptionsOverlay"/> on top of the existing application configuration.
+        /// </summary>
+        /// <param name="overlay">The overlay containing the property values to be overlaid.</param>
+        public static void ApplyConfigurationOverlay(OptionsOverlay overlay) => VolatileOverlayConfigurationSource.Apply(overlay);
 
         /// <summary>
         ///     Entrypoint.
@@ -312,22 +361,44 @@ namespace slskd
 
             // the application isn't being run in command mode. check the mutex to ensure
             // only one long-running instance.
-            if (!Mutex.WaitOne(millisecondsTimeout: 0, exitContext: false))
+            try
             {
-                Log.Fatal($"An instance of {AppName} is already running");
+                Mutex = new Mutex(initiallyOwned: true, Compute.Sha256Hash(AppName), out bool created);
+
+                if (!created)
+                {
+                    Log.Fatal($"An instance of {AppName} is already running");
+                    return;
+                }
+            }
+            catch (IOException ex)
+            {
+                Log.Fatal($"I/O exception attempting to acquire the application singleton mutex; this can happen when running in a restricted environment (such as a read-only filesystem or container). Exception: {ex.Message}");
+                return;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                Log.Fatal($"Unauthorized access attempting to acquire the application singleton mutex; this can happen when running with insuffucent permissions. Exception: {ex.Message}");
+                return;
+            }
+            catch (Exception ex)
+            {
+                Log.Fatal($"Failed to acquire the application singleton mutex: {ex.Message}");
                 return;
             }
 
             // derive the application directory value and defaults that are dependent upon it
             AppDirectory ??= DefaultAppDirectory;
             DataDirectory = Path.Combine(AppDirectory, "data");
+            DataBackupDirectory = Path.Combine(DataDirectory, "backups");
             LogDirectory = Path.Combine(AppDirectory, "logs");
+            ScriptDirectory = Path.Combine(AppDirectory, "scripts");
 
             DefaultConfigurationFile = Path.Combine(AppDirectory, $"{AppName}.yml");
             DefaultDownloadsDirectory = Path.Combine(AppDirectory, "downloads");
             DefaultIncompleteDirectory = Path.Combine(AppDirectory, "incomplete");
 
-            // the location of the configuration file might have been overriden by command line or envar.
+            // the location of the configuration file might have been overridden by command line or envar.
             // if not, set it to the default.
             ConfigurationFile ??= DefaultConfigurationFile;
 
@@ -337,6 +408,8 @@ namespace slskd
             {
                 VerifyDirectory(AppDirectory, createIfMissing: true, verifyWriteable: true);
                 VerifyDirectory(DataDirectory, createIfMissing: true, verifyWriteable: true);
+                VerifyDirectory(DataBackupDirectory, createIfMissing: true, verifyWriteable: true);
+                VerifyDirectory(ScriptDirectory, createIfMissing: true, verifyWriteable: false);
                 VerifyDirectory(DefaultDownloadsDirectory, createIfMissing: true, verifyWriteable: true);
                 VerifyDirectory(DefaultIncompleteDirectory, createIfMissing: true, verifyWriteable: true);
             }
@@ -424,10 +497,6 @@ namespace slskd
             {
                 Log.Information("Saving application logs to {LogDirectory}", LogDirectory);
             }
-            else
-            {
-                Log.Information("Logging to disk is disabled");
-            }
 
             RecreateConfigurationFileIfMissing(ConfigurationFile);
 
@@ -451,13 +520,39 @@ namespace slskd
                     .UseUrls()
                     .UseKestrel(options =>
                     {
-                        Log.Information($"Listening for HTTP requests at http://{IPAddress.Any}:{OptionsAtStartup.Web.Port}/");
-                        options.Listen(IPAddress.Any, OptionsAtStartup.Web.Port);
-
-                        if (!OptionsAtStartup.Web.Https.Disabled)
+                        // configure HTTP, either by listening at any IP or by each of the IPs provided in the
+                        // config (note: they've already been validated at this point!)
+                        if (string.IsNullOrWhiteSpace(OptionsAtStartup.Web.IpAddress))
                         {
-                            Log.Information($"Listening for HTTPS requests at https://{IPAddress.Any}:{OptionsAtStartup.Web.Https.Port}/");
-                            options.Listen(IPAddress.Any, OptionsAtStartup.Web.Https.Port, listenOptions =>
+                            Log.Information("Listening for HTTP requests at http://{IP}:{Port}/", IPAddress.IPv6Any, OptionsAtStartup.Web.Port);
+                            options.Listen(IPAddress.IPv6Any, OptionsAtStartup.Web.Port); // [::]; any IPv4 or IPv6 address
+                        }
+                        else
+                        {
+                            var httpIps = OptionsAtStartup.Web.IpAddress
+                                .Split(',')
+                                .Select(ip => ip.Trim())
+                                .Select(ip => IPAddress.Parse(ip));
+
+                            foreach (var ip in httpIps)
+                            {
+                                Log.Information("Listening for HTTP requests at http://{IP}:{Port}/", ip, OptionsAtStartup.Web.Port);
+                                options.Listen(ip, OptionsAtStartup.Web.Port);
+                            }
+                        }
+
+                        // configure UDS, if supplied
+                        if (OptionsAtStartup.Web.Socket != null)
+                        {
+                            Log.Information($"Listening for HTTP requests on unix domain socket (UDS) {OptionsAtStartup.Web.Socket}");
+                            options.ListenUnixSocket(OptionsAtStartup.Web.Socket);
+                        }
+
+                        // configure HTTPS, again listening on any IP or on a list of supplied IPs
+                        // use a local function because Microsoft can't get enough of the obtuse builder pattern
+                        static void ListenHttps(KestrelServerOptions o, IPAddress ip)
+                        {
+                            o.Listen(ip, OptionsAtStartup.Web.Https.Port, listenOptions =>
                             {
                                 var cert = OptionsAtStartup.Web.Https.Certificate;
 
@@ -473,6 +568,28 @@ namespace slskd
                                 }
                             });
                         }
+
+                        if (!OptionsAtStartup.Web.Https.Disabled)
+                        {
+                            if (string.IsNullOrWhiteSpace(OptionsAtStartup.Web.Https.IpAddress))
+                            {
+                                Log.Information("Listening for HTTPS requests at https://{IP}:{Port}/", IPAddress.IPv6Any, OptionsAtStartup.Web.Https.Port);
+                                ListenHttps(options, IPAddress.IPv6Any);
+                            }
+                            else
+                            {
+                                var httpsIps = OptionsAtStartup.Web.Https.IpAddress
+                                    .Split(',')
+                                    .Select(ip => ip.Trim())
+                                    .Select(ip => IPAddress.Parse(ip));
+
+                                foreach (var ip in httpsIps)
+                                {
+                                    Log.Information("Listening for HTTPS requests at https://{IP}:{Port}/", ip, OptionsAtStartup.Web.Https.Port);
+                                    ListenHttps(options, ip);
+                                }
+                            }
+                        }
                     });
 
                 builder.Services
@@ -481,11 +598,25 @@ namespace slskd
 
                 var app = builder.Build();
 
+                if (!OptionsAtStartup.Flags.Volatile)
+                {
+                    Log.Debug($"Running Migrate()...");
+
+                    // note: if this ever throws, we've forgotten to register a Migrator following database DI config
+                    app.Services.GetService<Migrator>().Migrate(force: OptionsAtStartup.Flags.ForceMigrations);
+                }
+
+                // hack: services that exist only to subscribe to the event bus are not referenced by anything else
+                //       and are thus never instantiated.  force a reference here so they are created.
+                _ = app.Services.GetService<ScriptService>();
+                _ = app.Services.GetService<WebhookService>();
+                _ = app.Services.GetService<VPNService>();
+
                 app.ConfigureAspDotNetPipeline();
 
                 if (OptionsAtStartup.Flags.NoStart)
                 {
-                    Log.Information("Qutting because 'no-start' option is enabled");
+                    Log.Information("Quitting because 'no-start' option is enabled");
                     return;
                 }
 
@@ -498,6 +629,15 @@ namespace slskd
             }
             finally
             {
+                try
+                {
+                    Mutex?.Dispose();
+                }
+                catch (Exception)
+                {
+                    // Ignore disposal errors to prevent masking other exceptions
+                }
+
                 Serilog.Log.CloseAndFlush();
             }
         }
@@ -536,13 +676,26 @@ namespace slskd
             // this is important to prevent memory leaks
             services.AddHttpClient();
 
+            // add a special HttpClientFactory to DI that disables SSL.  access it via:
+            // 'using var http = HttpClientFactory.CreateClient(Constants.IgnoreCertificateErrors)'
+            // thanks Microsoft, makes total sense and surely won't be easy to fuck up later!
+            services.AddHttpClient(Constants.IgnoreCertificateErrors)
+                .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+                {
+                    ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+                });
+
             // add a partially configured instance of SoulseekClient. the Application instance will
             // complete configuration at startup.
             services.AddSingleton<ISoulseekClient, SoulseekClient>(_ =>
-                new SoulseekClient(options: new SoulseekClientOptions(
-                    maximumConcurrentUploads: OptionsAtStartup.Global.Upload.Slots,
-                    maximumConcurrentDownloads: OptionsAtStartup.Global.Download.Slots,
-                    minimumDiagnosticLevel: OptionsAtStartup.Soulseek.DiagnosticLevel)));
+                new SoulseekClient(
+                    minorVersion: NetworkMinorVersion,
+                    options: new SoulseekClientOptions(
+                    maximumConcurrentUploads: OptionsAtStartup.Transfers.Upload.Slots,
+                    maximumConcurrentDownloads: OptionsAtStartup.Transfers.Download.Slots,
+                    minimumDiagnosticLevel: OptionsAtStartup.Soulseek.DiagnosticLevel.ToEnum<Soulseek.Diagnostics.DiagnosticLevel>(),
+                    maximumConcurrentSearches: 2,
+                    raiseEventsAsynchronously: true)));
 
             // add the core application service to DI as well as a hosted service so that other services can
             // access instance methods
@@ -550,21 +703,49 @@ namespace slskd
             services.AddHostedService(p => p.GetRequiredService<IApplication>());
 
             services.AddSingleton<IWaiter, Waiter>();
+            services.AddSingleton<ConnectionWatchdog, ConnectionWatchdog>();
 
-            services.AddSingleton<IConnectionWatchdog, ConnectionWatchdog>();
+            // wire up all of the connection strings we'll use. this is somewhat annoying but necessary because of the
+            // intersection of run-time options (volatile, non-volatile) and ORM/mappers in use (EF, Dapper)
+            var connectionStringDictionary = new ConnectionStringDictionary(Database.List
+                .Select(database =>
+                {
+                    var pooling = OptionsAtStartup.Flags.NoSqlitePooling ? "False" : "True"; // don't invert and ToString this it is confusing
 
-            if (OptionsAtStartup.Flags.Volatile)
+                    var connStr = OptionsAtStartup.Flags.Volatile
+                        ? $"Data Source=file:{database}?mode=memory;Pooling={pooling};"
+                        : $"Data Source={Path.Combine(DataDirectory, $"{database}.db")};Pooling={pooling}";
+
+                    return new KeyValuePair<Database, ConnectionString>(database, connStr);
+                })
+                .ToDictionary(x => x.Key, x => x.Value));
+
+            services.AddDbContext<SearchDbContext>(connectionStringDictionary[Database.Search]);
+            services.AddDbContext<TransfersDbContext>(connectionStringDictionary[Database.Transfers]);
+            services.AddDbContext<MessagingDbContext>(connectionStringDictionary[Database.Messaging]);
+            services.AddDbContext<EventsDbContext>(connectionStringDictionary[Database.Events]);
+
+            services.AddSingleton<ConnectionStringDictionary>(connectionStringDictionary);
+
+            if (!OptionsAtStartup.Flags.Volatile)
             {
-                services.AddDbContext<SearchDbContext>($"Data Source=file:search?mode=memory;Cache=shared;Pooling=True;");
-                services.AddDbContext<TransfersDbContext>($"Data Source=file:transfers?mode=memory;Cache=shared;Pooling=True;");
-                services.AddDbContext<MessagingDbContext>($"Data Source=file:messaging?mode=memory;Cache=shared;Pooling=True;");
+                // we're working with non-volatile database files, so register a Migrator to be used later in the
+                // bootup process. the presence of a Migrator instance in DI determines whether a migration is needed.
+                // it's important that we keep this list of databases in sync with those used by the application; anything
+                // not in this list will not be able to be migrated.
+                services.AddSingleton<Migrator>(_ => new Migrator(databases: connectionStringDictionary));
             }
-            else
-            {
-                services.AddDbContext<SearchDbContext>($"Data Source={Path.Combine(DataDirectory, "search.db")};Cache=shared;Pooling=True;");
-                services.AddDbContext<TransfersDbContext>($"Data Source={Path.Combine(DataDirectory, "transfers.db")};Cache=shared;Pooling=True;");
-                services.AddDbContext<MessagingDbContext>($"Data Source={Path.Combine(DataDirectory, "messaging.db")};Cache=shared;Pooling=True;");
-            }
+
+            services.AddSingleton<EventService>();
+            services.AddSingleton<EventBus>();
+
+            services.AddSingleton<PrometheusService>();
+            services.AddSingleton<ReportsService>();
+            services.AddSingleton<TelemetryService>();
+
+            services.AddSingleton<VPNService>();
+            services.AddSingleton<ScriptService>();
+            services.AddSingleton<WebhookService>();
 
             services.AddSingleton<IBrowseTracker, BrowseTracker>();
             services.AddSingleton<IRoomTracker, RoomTracker>(_ => new RoomTracker(messageLimit: 250));
@@ -576,13 +757,15 @@ namespace slskd
             services.AddTransient<IShareRepositoryFactory, SqliteShareRepositoryFactory>();
 
             services.AddSingleton<ISearchService, SearchService>();
+
             services.AddSingleton<IUserService, UserService>();
+
             services.AddSingleton<IRoomService, RoomService>();
 
             services.AddSingleton<ITransferService, TransferService>();
             services.AddSingleton<IDownloadService, DownloadService>();
             services.AddSingleton<IUploadService, UploadService>();
-            services.AddTransient<IFileService, FileService>();
+            services.AddSingleton<FileService>();
 
             services.AddSingleton<IRelayService, RelayService>();
 
@@ -613,7 +796,7 @@ namespace slskd
 
             if (SQLitePCL.raw.sqlite3_config(SQLitePCL.raw.SQLITE_CONFIG_SERIALIZED) != SQLitePCL.raw.SQLITE_OK)
             {
-                throw new InvalidOperationException($"SQLite threading mode could not be set to . Please create a GitHub issue to report this and include details about your environment.");
+                throw new InvalidOperationException($"SQLite threading mode could not be set to SERIALIZED ({SQLitePCL.raw.SQLITE_CONFIG_SERIALIZED}). Please create a GitHub issue to report this and include details about your environment.");
             }
 
             Log.Debug("SQLite threading mode set to {Mode} ({Number})", "SERIALIZED", SQLitePCL.raw.SQLITE_CONFIG_SERIALIZED);
@@ -626,10 +809,12 @@ namespace slskd
                 .AllowAnyHeader()
                 .AllowAnyMethod()
                 .AllowCredentials()
-                .WithExposedHeaders("X-URL-Base")));
+                .WithExposedHeaders("X-URL-Base", "X-Total-Count")));
 
+            // note: don't dispose this (or let it be disposed) or some of the stats, like those related
+            // to the thread pool won't work
+            DotNetRuntimeStats = DotNetRuntimeStatsBuilder.Default().StartCollecting();
             services.AddSystemMetrics();
-            using var runtimeMetrics = DotNetRuntimeStatsBuilder.Default().StartCollecting();
 
             services.AddDataProtection()
                 .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(DataDirectory, "misc", ".DataProtection-Keys")));
@@ -637,7 +822,7 @@ namespace slskd
             var jwtSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(OptionsAtStartup.Web.Authentication.Jwt.Key));
 
             services.AddSingleton(jwtSigningKey);
-            services.AddSingleton<ISecurityService, SecurityService>();
+            services.AddSingleton<SecurityService>();
 
             if (!OptionsAtStartup.Web.Authentication.Disabled)
             {
@@ -704,7 +889,7 @@ namespace slskd
                                         try
                                         {
                                             // check to see if the provided value is a valid API key
-                                            var service = services.BuildServiceProvider().GetRequiredService<ISecurityService>();
+                                            var service = services.BuildServiceProvider().GetRequiredService<SecurityService>();
                                             var (name, role) = service.AuthenticateWithApiKey(token, callerIpAddress: context.HttpContext.Connection.RemoteIpAddress);
 
                                             // the API key is valid. create a new, short lived jwt for the key name and role
@@ -759,12 +944,23 @@ namespace slskd
             }
 
             services.AddRouting(options => options.LowercaseUrls = true);
-            services.AddControllers().AddJsonOptions(options =>
+            services.AddControllers(options =>
             {
-                options.JsonSerializerOptions.Converters.Add(new IPAddressConverter());
-                options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
-                options.JsonSerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
-            });
+                options.ModelBinderProviders.Insert(0, new UrlEncodingModelBinderProvider());
+            })
+                .ConfigureApiBehaviorOptions(options =>
+                {
+                    options.SuppressInferBindingSourcesForParameters = true; // explicit [FromRoute], etc
+                    options.SuppressMapClientErrors = true; // disables automatic ProblemDetails for 4xx
+                    options.SuppressModelStateInvalidFilter = true; // disables automatic 400 for model errors
+                    options.DisableImplicitFromServicesParameters = true; // explicit [FromServices]
+                })
+                .AddJsonOptions(options =>
+                {
+                    options.JsonSerializerOptions.Converters.Add(new IPAddressConverter());
+                    options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+                    options.JsonSerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+                });
 
             services
                 .AddSignalR(options =>
@@ -780,7 +976,10 @@ namespace slskd
 
             services.AddHealthChecks();
 
-            services.AddApiVersioning(options => options.ReportApiVersions = true)
+            services.AddApiVersioning(options =>
+                {
+                    options.ReportApiVersions = true;
+                })
                 .AddApiExplorer(options =>
                 {
                     options.GroupNameFormat = "'v'VVV";
@@ -792,13 +991,25 @@ namespace slskd
                 services.AddSwaggerGen(options =>
                 {
                     options.DescribeAllParametersInCamelCase();
-                    options.SwaggerDoc(
-                        "v0",
-                        new OpenApiInfo
+                    options.SwaggerDoc("v0", new OpenApiInfo
+                    {
+                        Version = "v0",
+                        Title = AppName,
+                        Description = "A modern client-server application for the Soulseek file sharing network",
+                        Contact = new OpenApiContact
                         {
-                            Title = AppName,
-                            Version = "v0",
-                        });
+                            Name = "GitHub",
+                            Url = new Uri("https://github.com/slskd/slskd"),
+                        },
+                        License = new OpenApiLicense
+                        {
+                            Name = "AGPL-3.0 license",
+                            Url = new Uri("https://github.com/slskd/slskd/blob/master/LICENSE"),
+                        },
+                    });
+
+                    // allow endpoints marked with multiple content types in [Produces] to generate properly
+                    options.OperationFilter<ContentNegotiationOperationFilter>();
 
                     if (IOFile.Exists(XmlDocumentationFile))
                     {
@@ -816,6 +1027,7 @@ namespace slskd
 
         private static WebApplication ConfigureAspDotNetPipeline(this WebApplication app)
         {
+            // stop ASP.NET from sending a full stack trace and ProblemDetails for unhandled exceptions
             app.UseExceptionHandler(a => a.Run(async context =>
             {
                 await context.Response.WriteAsJsonAsync(context.Features.Get<IExceptionHandlerPathFeature>().Error.Message);
@@ -855,8 +1067,15 @@ namespace slskd
                 EnableDefaultFiles = true,
             };
 
-            app.UseFileServer(fileServerOptions);
-            Log.Information("Serving static content from {ContentPath}", contentPath);
+            if (!OptionsAtStartup.Headless)
+            {
+                app.UseFileServer(fileServerOptions);
+                Log.Information("Serving static content from {ContentPath}", contentPath);
+            }
+            else
+            {
+                Log.Warning("Running in headless mode; web UI is DISABLED");
+            }
 
             if (OptionsAtStartup.Web.Logging)
             {
@@ -895,6 +1114,10 @@ namespace slskd
 
                     endpoints.MapGet(url, async context =>
                     {
+                        // at the time of writing, the prometheus library doesn't include a way to add authentication
+                        // to the UseMetricServer() middleware. this is most likely a consequence of me mixing
+                        // and matching minimal API stuff with controllers. if i ever straighten that out,
+                        // this should be revisited.
                         if (!options.Authentication.Disabled)
                         {
                             var auth = context.Request.Headers["Authorization"].FirstOrDefault();
@@ -910,8 +1133,11 @@ namespace slskd
                             }
                         }
 
-                        var response = await Metrics.BuildAsync();
-                        await context.Response.WriteAsync(response);
+                        var telemetryService = context.RequestServices.GetRequiredService<TelemetryService>();
+                        var metricsAsText = await telemetryService.Prometheus.GetMetricsAsString();
+
+                        context.Response.Headers.Append("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+                        await context.Response.WriteAsync(metricsAsText);
                     });
                 }
             });
@@ -938,37 +1164,49 @@ namespace slskd
                 Log.Information("Publishing Swagger documentation to {URL}", "/swagger");
             }
 
-            // if we made it this far, the caller is either looking for a route that was synthesized with a SPA router, or is genuinely confused.
-            // if the request is for a directory, modify the request to redirect it to the index, otherwise leave it alone and let it 404 in the next
-            // middleware
-            app.Use(async (context, next) =>
+            /*
+                if we made it this far, the caller is either looking for a route that was synthesized with a SPA router, or is genuinely confused.
+                if the request is for a directory, modify the request to redirect it to the index, otherwise leave it alone and let it 404 in the next
+                middleware.
+
+                if we're running in headless mode, do nothing and let ASP.NET return a 404
+            */
+            if (!OptionsAtStartup.Headless)
             {
-                if (Path.GetExtension(context.Request.Path.ToString()) == string.Empty)
+                app.Use(async (context, next) =>
                 {
-                    context.Request.Path = "/";
-                }
+                    if (Path.GetExtension(context.Request.Path.ToString()) == string.Empty)
+                    {
+                        context.Request.Path = "/";
+                    }
 
-                await next();
-            });
+                    await next();
+                });
 
-            // either serve the index, or 404
-            app.UseFileServer(fileServerOptions);
+                // either serve the index, or 404
+                app.UseFileServer(fileServerOptions);
+            }
 
             return app;
         }
 
         private static void ConfigureGlobalLogger()
         {
+            var noColor = OptionsAtStartup.Logger.NoColor || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NO_COLOR"));
+
             Serilog.Log.Logger = (OptionsAtStartup.Debug ? new LoggerConfiguration().MinimumLevel.Debug() : new LoggerConfiguration().MinimumLevel.Information())
                 .MinimumLevel.Override("Microsoft", LogEventLevel.Error)
                 .MinimumLevel.Override("System.Net.Http.HttpClient", OptionsAtStartup.Debug ? LogEventLevel.Warning : LogEventLevel.Fatal)
                 .MinimumLevel.Override("slskd.Authentication.PassthroughAuthenticationHandler", LogEventLevel.Warning)
                 .MinimumLevel.Override("slskd.Authentication.ApiKeyAuthenticationHandler", LogEventLevel.Warning)
+                .MinimumLevel.Override("Microsoft.EntityFrameworkCore.Database.Command", LogEventLevel.Warning) // bump this down to Information to show SQL
                 .Enrich.WithProperty("InstanceName", OptionsAtStartup.InstanceName)
                 .Enrich.WithProperty("InvocationId", InvocationId)
                 .Enrich.WithProperty("ProcessId", ProcessId)
                 .Enrich.FromLogContext()
                 .WriteTo.Console(
+                    theme: noColor ? ConsoleTheme.None : SystemConsoleTheme.Literate,
+                    applyThemeToRedirectedOutput: !noColor,
                     outputTemplate: (OptionsAtStartup.Debug ? "[{SourceContext}] " : string.Empty) + "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
                 .WriteTo.Async(config =>
                     config.Conditional(
@@ -1014,6 +1252,30 @@ namespace slskd
                     }
                 }))
                 .CreateLogger();
+
+            if (OptionsAtStartup.Flags.LogUnobservedExceptions)
+            {
+                // log Exceptions raised on fired-and-forgotten tasks, which adds very little value but might help debug someday
+                TaskScheduler.UnobservedTaskException += (sender, e) =>
+                {
+                    Serilog.Log.Logger.Error(e.Exception, "Unobserved exception: {Message}", e.Exception.Message);
+                    e.SetObserved();
+                };
+            }
+
+            AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
+            {
+                var exception = e.ExceptionObject as Exception;
+
+                if (e.IsTerminating)
+                {
+                    Serilog.Log.Logger.Fatal(exception, "Unhandled fatal exception: {Message}", e.IsTerminating);
+                }
+                else
+                {
+                    Serilog.Log.Logger.Error(exception, "Unhandled exception: {Message}", exception.Message);
+                }
+            };
         }
 
         private static IConfigurationBuilder AddConfigurationProviders(this IConfigurationBuilder builder, string environmentVariablePrefix, string configurationFile, bool reloadOnChange)
@@ -1047,7 +1309,8 @@ namespace slskd
                 .AddCommandLine(
                     targetType: typeof(Options),
                     multiValuedArguments,
-                    commandLine: Environment.CommandLine);
+                    commandLine: Environment.CommandLine)
+                .Add(VolatileOverlayConfigurationSource); // this must come last in order to supersede all other sources
         }
 
         private static IServiceCollection AddDbContext<T>(this IServiceCollection services, string connectionString)
@@ -1060,17 +1323,60 @@ namespace slskd
                 services.AddDbContextFactory<T>(options =>
                 {
                     options.UseSqlite(connectionString);
+                    options.AddInterceptors(new SqliteConnectionOpenedInterceptor());
 
-                    if (OptionsAtStartup.Debug && OptionsAtStartup.Flags.LogSQL)
+                    if (OptionsAtStartup.Flags.LogSQL)
                     {
-                        options.LogTo(Log.Debug, LogLevel.Information);
+                        options
+                            .EnableSensitiveDataLogging()
+                            .EnableDetailedErrors()
+                            .LogTo(OptionsAtStartup.Debug ? Log.Debug : Log.Information, LogLevel.Information);
                     }
                 });
 
+                /*
+                    instantiate the DbContext and make sure it is created
+                */
                 using var ctx = services
                     .BuildServiceProvider()
                     .GetRequiredService<IDbContextFactory<T>>()
                     .CreateDbContext();
+
+                Log.Debug("Ensuring {Contex} is created", typeof(T).Name);
+                ctx.Database.EnsureCreated();
+
+                /*
+                    set (and validate) our desired PRAGMAs
+
+                    synchronous mode is also set upon every connection via SqliteConnectionOpenedInterceptor.
+                */
+                ctx.Database.OpenConnection();
+                var conn = ctx.Database.GetDbConnection();
+
+                Log.Debug("Setting PRAGMAs for {Contex}", typeof(T).Name);
+                using var initCommand = conn.CreateCommand();
+                initCommand.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=1; PRAGMA optimize;";
+                initCommand.ExecuteNonQuery();
+
+                using var journalCmd = conn.CreateCommand();
+                journalCmd.CommandText = "PRAGMA journal_mode;";
+                var journalMode = journalCmd.ExecuteScalar()?.ToString();
+
+                if (!journalMode.Equals("WAL", StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Warning("Failed to set database {Type} journal_mode PRAGMA to WAL; performance may be reduced", typeof(T).Name);
+                }
+
+                using var syncCmd = conn.CreateCommand();
+                syncCmd.CommandText = "PRAGMA synchronous;";
+                var sync = syncCmd.ExecuteScalar()?.ToString();
+
+                if (!sync.Equals("1", StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Warning("Failed to set database {Type} synchronous PRAGMA to 1; performance may be reduced", typeof(T).Name);
+                }
+
+                Log.Debug("PRAGMAs for {Context}: journal_mode={JournalMode}, synchronous={Synchronous}", typeof(T).Name, journalMode, sync);
 
                 return services;
             }

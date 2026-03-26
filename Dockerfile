@@ -40,6 +40,7 @@ ARG REVISION=0
 ARG BUILD_DATE
 
 RUN apt-get update && apt-get install --no-install-recommends -y \
+  jq \
   wget \
   tini \
   && \
@@ -56,13 +57,16 @@ RUN bash -c 'mkdir -p /app/{incomplete,downloads} \
 
 VOLUME /app
 
-HEALTHCHECK --interval=60s --timeout=3s --start-period=5s --retries=3 CMD wget -q -O - http://localhost:${SLSKD_HTTP_PORT}/health
+HEALTHCHECK --interval=60s --timeout=3s --start-period=60m --retries=3 CMD wget -q -O - http://localhost:${SLSKD_HTTP_PORT}/health
 
-ENV DOTNET_BUNDLE_EXTRACT_BASE_DIR=/.net \
+ENV SHELL=/usr/bin/bash \
+  DOTNET_EnableDiagnostics=0 \
+  DOTNET_BUNDLE_EXTRACT_BASE_DIR=/.net \
   DOTNET_gcServer=0 \
   DOTNET_gcConcurrent=1 \
-  DOTNET_GCHeapHardLimit=1F400000	\
+  DOTNET_GCHeapHardLimit=0x80000000	\
   DOTNET_GCConserveMemory=9 \
+  SLSKD_UMASK=0022 \
   SLSKD_HTTP_PORT=5030 \
   SLSKD_HTTPS_PORT=5031 \
   SLSKD_SLSK_LISTEN_PORT=50300 \
@@ -87,4 +91,7 @@ LABEL org.opencontainers.image.title=slskd \
 WORKDIR /slskd
 COPY --from=publish /slskd/dist/${TARGETPLATFORM} .
 
-ENTRYPOINT ["/usr/bin/tini", "--", "./slskd"]
+RUN echo "umask \$SLSKD_UMASK && ./slskd" > start.sh \
+  && chmod +x start.sh
+
+ENTRYPOINT ["/usr/bin/tini", "--", "./start.sh"]

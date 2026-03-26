@@ -32,6 +32,7 @@ namespace slskd.Relay
     using Microsoft.Extensions.Caching.Memory;
     using Serilog;
     using slskd.Cryptography;
+    using slskd.Files;
     using slskd.Shares;
 
     /// <summary>
@@ -87,7 +88,7 @@ namespace slskd.Relay
         ///     Retrieves information about the specified <paramref name="filename"/> from the specified <paramref name="agentName"/>.
         /// </summary>
         /// <remarks>
-        ///     <para>This is the first step in a mult-step workflow. The entire sequence is:</para>
+        ///     <para>This is the first step in a multi-step workflow. The entire sequence is:</para>
         ///     <list type="number">
         ///         <item>
         ///             Upload service calls and awaits <see cref="GetFileInfoAsync"/>, which requests the file info from the
@@ -189,9 +190,10 @@ namespace slskd.Relay
         /// <summary>
         ///     Notifies the caller of <see cref="GetFileStreamAsync"/> of a failure to obtain a file stream from the requested agent.
         /// </summary>
+        /// <param name="agentName">The name of the agent.</param>
         /// <param name="id">The unique ID for the stream.</param>
         /// <param name="exception">The remote exception that caused the failure.</param>
-        void NotifyFileStreamException(Guid id, Exception exception);
+        void NotifyFileStreamException(string agentName, Guid id, Exception exception);
 
         /// <summary>
         ///     Registers the specified <paramref name="agent"/> with the specified <paramref name="connectionId"/>.
@@ -272,6 +274,7 @@ namespace slskd.Relay
         ///     Initializes a new instance of the <see cref="RelayService"/> class.
         /// </summary>
         /// <param name="waiter"></param>
+        /// <param name="fileService"></param>
         /// <param name="shareService"></param>
         /// <param name="shareRepositoryFactory"></param>
         /// <param name="optionsMonitor"></param>
@@ -280,6 +283,7 @@ namespace slskd.Relay
         /// <param name="relayClient"></param>
         public RelayService(
             IWaiter waiter,
+            FileService fileService,
             IShareService shareService,
             IShareRepositoryFactory shareRepositoryFactory,
             IOptionsMonitor<Options> optionsMonitor,
@@ -287,6 +291,7 @@ namespace slskd.Relay
             IHttpClientFactory httpClientFactory,
             IRelayClient relayClient = null)
         {
+            Files = fileService;
             Shares = shareService;
             ShareRepositoryFactory = shareRepositoryFactory;
             Waiter = waiter;
@@ -319,6 +324,7 @@ namespace slskd.Relay
         /// </summary>
         public IStateMonitor<RelayState> StateMonitor { get; }
 
+        private FileService Files { get; }
         private IHttpClientFactory HttpClientFactory { get; }
         private string LastControllerOptionsHash { get; set; }
         private string LastOptionsHash { get; set; }
@@ -389,7 +395,7 @@ namespace slskd.Relay
         ///     Retrieves information about the specified <paramref name="filename"/> from the specified <paramref name="agentName"/>.
         /// </summary>
         /// <remarks>
-        ///     <para>This is the first step in a mult-step workflow. The entire sequence is:</para>
+        ///     <para>This is the first step in a multi-step workflow. The entire sequence is:</para>
         ///     <list type="number">
         ///         <item>
         ///             Upload service calls and awaits <see cref="GetFileInfoAsync"/>, which requests the file info from the
@@ -651,11 +657,12 @@ namespace slskd.Relay
         /// <summary>
         ///     Notifies the caller of <see cref="GetFileStreamAsync"/> of a failure to obtain a file stream from the requested agent.
         /// </summary>
+        /// <param name="agentName">The name of the agent.</param>
         /// <param name="id">The unique ID for the stream.</param>
         /// <param name="exception">The remote exception that caused the failure.</param>
-        public void NotifyFileStreamException(Guid id, Exception exception)
+        public void NotifyFileStreamException(string agentName, Guid id, Exception exception)
         {
-            var key = new WaitKey(nameof(GetFileStreamAsync), id);
+            var key = new WaitKey(nameof(GetFileStreamAsync), agentName, id);
             Waiter.Throw(key, exception);
         }
 
@@ -831,7 +838,12 @@ namespace slskd.Relay
                     else
                     {
                         // the controller changed. disconnect and throw away the client and create a new one
-                        Client = new RelayClient(Shares, OptionsMonitor, HttpClientFactory);
+                        Client = new RelayClient(
+                            shareService: Shares,
+                            fileService: Files,
+                            optionsMonitor: OptionsMonitor,
+                            httpClientFactory: HttpClientFactory);
+
                         Client.StateMonitor.OnChange(clientState
                             => State.SetValue(state => state with { Controller = state.Controller with { State = clientState.Current } }));
 

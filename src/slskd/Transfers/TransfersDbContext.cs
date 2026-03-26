@@ -26,10 +26,23 @@ namespace slskd.Transfers
         public TransfersDbContext(DbContextOptions<TransfersDbContext> options)
             : base(options)
         {
-            Database.EnsureCreated();
         }
 
         public DbSet<Transfer> Transfers { get; set; }
+
+        public override int SaveChanges(bool acceptAllChangesOnSuccess)
+        {
+            // this is absolutely NOT IDEAL and will accellerate the move away from EF
+            foreach (var entry in ChangeTracker.Entries<Transfer>())
+            {
+                if (entry.State == EntityState.Added || entry.State == EntityState.Modified)
+                {
+                    entry.Entity.StateDescription = entry.Entity.State.ToString();
+                }
+            }
+
+            return base.SaveChanges(acceptAllChangesOnSuccess);
+        }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -50,8 +63,41 @@ namespace slskd.Transfers
 
             modelBuilder
                 .Entity<Transfer>()
-                .Property(d => d.State)
-                .HasConversion(new EnumToStringConverter<Soulseek.TransferStates>());
+                .HasIndex(t => t.Direction)
+                .HasDatabaseName("IDX_Transfers_Direction");
+
+            modelBuilder
+                .Entity<Transfer>()
+                .HasIndex(t => t.State)
+                .HasDatabaseName("IDX_Transfers_State");
+
+            modelBuilder
+                .Entity<Transfer>()
+                .HasIndex(t => t.Removed)
+                .HasDatabaseName("IDX_Transfers_Removed");
+
+            modelBuilder
+                .Entity<Transfer>()
+                .Property(e => e.Attempts)
+                .HasDefaultValue(0); // force EF to match the migration
+
+            modelBuilder
+                .Entity<Transfer>()
+                .HasIndex(t => t.BatchId)
+                .HasDatabaseName("IDX_Transfers_BatchId");
+
+            // covers the check for existing records when enqueueing uploads and downloads
+            modelBuilder
+                .Entity<Transfer>()
+                .HasIndex(t => new { t.Username, t.Filename })
+                .HasDatabaseName("IDX_Transfers_UsernameFilename");
+
+            // covers the GetUserStatistics method that backs limit checks
+            // check every so often with EXPLAIN to make sure it's being shown as a covering index
+            modelBuilder
+                .Entity<Transfer>()
+                .HasIndex(e => new { e.Username, e.Direction, e.EndedAt, e.StartedAt, e.State, e.Size })
+                .HasDatabaseName("IDX_Transfers_UserUploadStatistics");
         }
     }
 }

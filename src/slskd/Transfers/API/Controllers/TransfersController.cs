@@ -23,17 +23,18 @@ namespace slskd.Transfers.API
     using System.Collections.Generic;
     using System.ComponentModel.DataAnnotations;
     using System.Linq;
+    using System.Threading;
     using System.Threading.Tasks;
     using Asp.Versioning;
     using Microsoft.AspNetCore.Authorization;
     using Microsoft.AspNetCore.Mvc;
+    using Serilog;
 
     /// <summary>
     ///     Transfers.
     /// </summary>
     [Route("api/v{version:apiVersion}/[controller]")]
     [ApiVersion("0")]
-    [ApiController]
     [Produces("application/json")]
     [Consumes("application/json")]
     public class TransfersController : ControllerBase
@@ -51,8 +52,10 @@ namespace slskd.Transfers.API
             OptionsSnapshot = optionsSnapshot;
         }
 
+        private static SemaphoreSlim DownloadRequestLimiter { get; } = new SemaphoreSlim(2, 2);
         private ITransferService Transfers { get; }
         private IOptionsSnapshot<Options> OptionsSnapshot { get; }
+        private ILogger Log { get; set; } = Serilog.Log.ForContext<TransfersController>();
 
         /// <summary>
         ///     Cancels the specified download.
@@ -67,7 +70,7 @@ namespace slskd.Transfers.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(204)]
         [ProducesResponseType(404)]
-        public IActionResult CancelDownloadAsync([FromRoute, Required] string username, [FromRoute, Required]string id, [FromQuery]bool remove = false)
+        public IActionResult CancelDownloadAsync([FromRoute, UrlEncoded, Required] string username, [FromRoute, Required] string id, [FromQuery] bool remove = false)
         {
             if (Program.IsRelayAgent)
             {
@@ -111,16 +114,16 @@ namespace slskd.Transfers.API
                 return Forbid();
             }
 
-            var transfers = Transfers.Downloads
-                .List() // https://github.com/dotnet/efcore/issues/10434
-                .Where(t => t.State.HasFlag(Soulseek.TransferStates.Completed));
-
-            foreach (var id in transfers.Select(t => t.Id))
+            try
             {
-                Transfers.Downloads.Remove(id);
+                Transfers.Downloads.Remove(t => !t.Removed && TransferStateCategories.Completed.Contains(t.State));
+                return NoContent();
             }
-
-            return NoContent();
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to remove completed downloads: {Message}", ex.Message);
+                return StatusCode(500, ex.Message);
+            }
         }
 
         /// <summary>
@@ -136,7 +139,7 @@ namespace slskd.Transfers.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(204)]
         [ProducesResponseType(404)]
-        public IActionResult CancelUpload([FromRoute, Required] string username, [FromRoute, Required]string id, [FromQuery]bool remove = false)
+        public IActionResult CancelUpload([FromRoute, UrlEncoded, Required] string username, [FromRoute, Required] string id, [FromQuery] bool remove = false)
         {
             if (Program.IsRelayAgent)
             {
@@ -180,17 +183,16 @@ namespace slskd.Transfers.API
                 return Forbid();
             }
 
-            // get all the transfers that aren't removed
-            var transfers = Transfers.Uploads
-                .List(t => true, includeRemoved: false) // https://github.com/dotnet/efcore/issues/10434
-                .Where(t => t.State.HasFlag(Soulseek.TransferStates.Completed));
-
-            foreach (var id in transfers.Select(t => t.Id))
+            try
             {
-                Transfers.Uploads.Remove(id);
+                Transfers.Uploads.Remove(t => !t.Removed && TransferStateCategories.Completed.Contains(t.State));
+                return NoContent();
             }
-
-            return NoContent();
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to remove completed uploads: {Message}", ex.Message);
+                return StatusCode(500, ex.Message);
+            }
         }
 
         /// <summary>
@@ -207,21 +209,47 @@ namespace slskd.Transfers.API
         [ProducesResponseType(201)]
         [ProducesResponseType(typeof(string), 403)]
         [ProducesResponseType(typeof(string), 500)]
-        public async Task<IActionResult> EnqueueAsync([FromRoute, Required]string username, [FromBody]IEnumerable<QueueDownloadRequest> requests)
+        public async Task<IActionResult> EnqueueAsync([FromRoute, UrlEncoded, Required] string username, [FromBody] IEnumerable<QueueDownloadRequest> requests)
         {
             if (Program.IsRelayAgent)
             {
                 return Forbid();
             }
 
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState.GetReadableString());
+            }
+
+            if (!requests?.Any() ?? true)
+            {
+                return BadRequest("At least one file is required");
+            }
+
+            if (requests.Any(r => r is null))
+            {
+                return BadRequest("One or more records in the request are null");
+            }
+
+            if (!DownloadRequestLimiter.Wait(0))
+            {
+                return StatusCode(429, "Only one concurrent operation is permitted. Wait until the previous request completes");
+            }
+
             try
             {
-                await Transfers.Downloads.EnqueueAsync(username, requests.Select(r => (r.Filename, r.Size)));
-                return StatusCode(201);
+                var (enqueued, failed) = await Transfers.Downloads.EnqueueAsync(username, requests.Select(r => (r.Filename, r.Size)));
+
+                return StatusCode(201, new { Enqueued = enqueued, Failed = failed });
             }
             catch (Exception ex)
             {
+                Log.Error(ex, "Failed to enqueue {Count} files for {Username}: {Message}", requests.Count(), username, ex.Message);
                 return StatusCode(500, ex.Message);
+            }
+            finally
+            {
+                DownloadRequestLimiter.Release();
             }
         }
 
@@ -233,7 +261,7 @@ namespace slskd.Transfers.API
         [HttpGet("downloads")]
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(200)]
-        public IActionResult GetDownloadsAsync([FromQuery]bool includeRemoved = false)
+        public IActionResult GetDownloadsAsync([FromQuery] bool includeRemoved = false)
         {
             if (Program.IsRelayAgent)
             {
@@ -265,7 +293,7 @@ namespace slskd.Transfers.API
         [HttpGet("downloads/{username}")]
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(200)]
-        public IActionResult GetDownloadsAsync([FromRoute, Required] string username)
+        public IActionResult GetDownloadsAsync([FromRoute, UrlEncoded, Required] string username)
         {
             if (Program.IsRelayAgent)
             {
@@ -297,7 +325,7 @@ namespace slskd.Transfers.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(typeof(API.Transfer), 200)]
         [ProducesResponseType(404)]
-        public IActionResult GetDownload([FromRoute, Required] string username, [FromRoute, Required] string id)
+        public IActionResult GetDownload([FromRoute, UrlEncoded, Required] string username, [FromRoute, Required] string id)
         {
             if (Program.IsRelayAgent)
             {
@@ -320,7 +348,7 @@ namespace slskd.Transfers.API
         }
 
         /// <summary>
-        ///     Gets the downlaod for the specified username matching the specified filename, and requests
+        ///     Gets the download for the specified username matching the specified filename, and requests
         ///     the current place in the remote queue of the specified download.
         /// </summary>
         /// <param name="username">The username of the download source.</param>
@@ -332,7 +360,7 @@ namespace slskd.Transfers.API
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(typeof(API.Transfer), 200)]
         [ProducesResponseType(404)]
-        public async Task<IActionResult> GetPlaceInQueueAsync([FromRoute, Required] string username, [FromRoute, Required] string id)
+        public async Task<IActionResult> GetPlaceInQueueAsync([FromRoute, UrlEncoded, Required] string username, [FromRoute, Required] string id)
         {
             if (Program.IsRelayAgent)
             {
@@ -401,7 +429,7 @@ namespace slskd.Transfers.API
         [HttpGet("uploads/{username}")]
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(200)]
-        public IActionResult GetUploads([FromRoute, Required] string username)
+        public IActionResult GetUploads([FromRoute, UrlEncoded, Required] string username)
         {
             if (Program.IsRelayAgent)
             {
@@ -439,7 +467,7 @@ namespace slskd.Transfers.API
         [HttpGet("uploads/{username}/{id}")]
         [Authorize(Policy = AuthPolicy.Any)]
         [ProducesResponseType(200)]
-        public IActionResult GetUploads([FromRoute, Required] string username, [FromRoute, Required] string id)
+        public IActionResult GetUploads([FromRoute, UrlEncoded, Required] string username, [FromRoute, Required] string id)
         {
             if (Program.IsRelayAgent)
             {

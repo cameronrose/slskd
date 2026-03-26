@@ -16,6 +16,7 @@
 // </copyright>
 
 using Microsoft.Extensions.Options;
+using slskd.Files;
 
 namespace slskd.Relay
 {
@@ -39,14 +40,17 @@ namespace slskd.Relay
         ///     Initializes a new instance of the <see cref="RelayClient"/> class.
         /// </summary>
         /// <param name="shareService"></param>
+        /// <param name="fileService"></param>
         /// <param name="optionsMonitor"></param>
         /// <param name="httpClientFactory"></param>
         public RelayClient(
             IShareService shareService,
+            FileService fileService,
             IOptionsMonitor<Options> optionsMonitor,
             IHttpClientFactory httpClientFactory)
         {
             Shares = shareService;
+            Files = fileService;
 
             HttpClientFactory = httpClientFactory;
 
@@ -63,6 +67,7 @@ namespace slskd.Relay
         /// </summary>
         public IStateMonitor<RelayClientState> StateMonitor { get; }
 
+        private FileService Files { get; }
         private SemaphoreSlim ConfigurationSyncRoot { get; } = new SemaphoreSlim(1, 1);
         private bool Disposed { get; set; }
         private IHttpClientFactory HttpClientFactory { get; }
@@ -157,8 +162,9 @@ namespace slskd.Relay
                         Log.Warning("Failed attempt #{Attempts} to connect to relay controller: {Message}", attempts, ex.Message);
                     },
                     maxAttempts: int.MaxValue,
+                    baseDelayInMilliseconds: 1000,
                     maxDelayInMilliseconds: 30000,
-                    StartCancellationTokenSource.Token);
+                    cancellationToken: StartCancellationTokenSource.Token);
             }
             finally
             {
@@ -360,7 +366,7 @@ namespace slskd.Relay
             {
                 var (_, localFilename, _) = await Shares.ResolveFileAsync(filename);
 
-                var localFileInfo = new FileInfo(localFilename);
+                var localFileInfo = Files.ResolveFileInfo(localFilename);
 
                 await HubConnection.InvokeAsync(nameof(RelayHub.ReturnFileInfo), id, localFileInfo.Exists, localFileInfo.Length);
             }
@@ -381,7 +387,7 @@ namespace slskd.Relay
                 {
                     var (_, localFilename, _) = await Shares.ResolveFileAsync(filename);
 
-                    var localFileInfo = new FileInfo(localFilename);
+                    var localFileInfo = Files.ResolveFileInfo(localFilename);
 
                     if (!localFileInfo.Exists)
                     {
@@ -477,6 +483,7 @@ namespace slskd.Relay
                 isRetryable: (_, _) => true,
                 onFailure: (_, ex) => Log.Error(ex, "Failed to handle file download notification for {Filename} ({Token})", filename, token),
                 maxAttempts: 3,
+                baseDelayInMilliseconds: 1000,
                 maxDelayInMilliseconds: 60000);
 
                 Log.Information("File {Filename} successfully downloaded to {Destination}", filename, destinationFile);
@@ -587,8 +594,9 @@ namespace slskd.Relay
                     isRetryable: (_, _) => true,
                     onFailure: (count, ex) => Log.Warning("Failed attempt #{Attempts} to obtain share upload token: {Message}", count, ex.Message),
                     maxAttempts: 3,
+                    baseDelayInMilliseconds: 1000,
                     maxDelayInMilliseconds: 5000,
-                    cancellationToken);
+                    cancellationToken: cancellationToken);
 
                 Log.Debug("Share upload token {Token}", token);
 

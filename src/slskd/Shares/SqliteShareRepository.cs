@@ -157,7 +157,9 @@ namespace slskd.Shares
         {
             using var conn = GetConnection();
 
-            conn.ExecuteNonQuery("PRAGMA journal_mode=WAL");
+            // warning: with synchronous=0, an operating system crash can leave the database corrupted.
+            // if this occurs we should generate a new one, so this is _probably_ ok
+            conn.ExecuteNonQuery("PRAGMA journal_mode=WAL; PRAGMA synchronous=0;");
 
             if (discardExisting)
             {
@@ -175,10 +177,14 @@ namespace slskd.Shares
             conn.ExecuteNonQuery("CREATE TABLE IF NOT EXISTS files " +
                 "(maskedFilename TEXT PRIMARY KEY, originalFilename TEXT NOT NULL, size BIGINT NOT NULL, touchedAt TEXT NOT NULL, code INTEGER DEFAULT 1 NOT NULL, " +
                 "extension TEXT, attributeJson TEXT NOT NULL, timestamp INTEGER NOT NULL);");
+
+            conn.ExecuteNonQuery("CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)");
+            conn.ExecuteNonQuery("CREATE INDEX IF NOT EXISTS idx_directories_timestamp ON directories(timestamp)");
+            conn.ExecuteNonQuery("CREATE INDEX IF NOT EXISTS idx_scans_timestamp ON scans(timestamp DESC)");
         }
 
         /// <summary>
-        ///     Diposes this object.
+        ///     Disposes this object.
         /// </summary>
         public void Dispose()
         {
@@ -220,7 +226,7 @@ namespace slskd.Shares
 
             if (!reader.Read())
             {
-                Log.Warning("Failed to resolve shared file {Filename}", maskedFilename);
+                Log.Debug("Failed to resolve shared file {Filename}", maskedFilename);
                 return default;
             }
 
@@ -258,7 +264,7 @@ namespace slskd.Shares
         }
 
         /// <summary>
-        ///     Flags the latest scan as suspect, indicating that the cached contents may have divered from physical storage.
+        ///     Flags the latest scan as suspect, indicating that the cached contents may have diverged from physical storage.
         /// </summary>
         public void FlagLatestScanAsSuspect()
         {
@@ -511,8 +517,9 @@ namespace slskd.Shares
         ///     Searches the database for files matching the specified <paramref name="query"/>.
         /// </summary>
         /// <param name="query">The search query.</param>
+        /// <param name="limit">An optional row limit.</param>
         /// <returns>The list of matching files.</returns>
-        public IEnumerable<Soulseek.File> Search(SearchQuery query)
+        public IEnumerable<Soulseek.File> Search(SearchQuery query, int? limit = null)
         {
             string Clean(string str) => str.Replace("/", " ")
                 .Replace("\\", " ")
@@ -526,7 +533,7 @@ namespace slskd.Shares
             var sql = $"SELECT files.maskedFilename, files.code, files.size, files.extension, files.attributeJson FROM filenames " +
                 "INNER JOIN files ON filenames.maskedFilename = files.maskedFilename " +
                 $"WHERE filenames MATCH '({match}) {(query.Exclusions.Any() ? $"NOT ({exclusions})" : string.Empty)}' " +
-                "ORDER BY filenames.maskedFilename ASC;";
+                $"ORDER BY filenames.maskedFilename ASC {(limit.HasValue ? $"LIMIT {limit.Value}" : string.Empty)};";
 
             var results = new List<Soulseek.File>();
 

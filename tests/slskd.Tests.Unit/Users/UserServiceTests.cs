@@ -2,7 +2,6 @@
 {
     using System.Collections.Generic;
     using AutoFixture.Xunit2;
-    using Microsoft.EntityFrameworkCore;
     using Moq;
     using slskd.Users;
     using Soulseek;
@@ -33,18 +32,21 @@
             {
                 var options = new Options()
                 {
-                    Groups = new Options.GroupsOptions()
+                    Transfers = new Options.TransfersOptions
                     {
-                        UserDefined = new Dictionary<string, Options.GroupsOptions.UserDefinedOptions>()
-                    {
-                        { 
-                            group, 
-                            new Options.GroupsOptions.UserDefinedOptions()
+                        Groups = new Options.TransfersOptions.GroupsOptions()
+                        {
+                            UserDefined = new Dictionary<string, Options.TransfersOptions.GroupsOptions.UserDefinedOptions>()
                             {
-                                Members = new[] { username },
+                                {
+                                    group,
+                                    new Options.TransfersOptions.GroupsOptions.UserDefinedOptions()
+                                    {
+                                        Members = new[] { username },
+                                    }
+                                },
                             }
-                        },
-                    }
+                        }
                     }
                 };
 
@@ -61,15 +63,21 @@
             {
                 var options = new Options()
                 {
-                    Groups = new Options.GroupsOptions()
+                    Transfers = new Options.TransfersOptions
                     {
-                        UserDefined = new Dictionary<string, Options.GroupsOptions.UserDefinedOptions>()
-                    {
-                        { group, new Options.GroupsOptions.UserDefinedOptions()
+                        Groups = new Options.TransfersOptions.GroupsOptions()
                         {
-                            Members = new[] { user },
-                        } },
-                    }
+                            UserDefined = new Dictionary<string, Options.TransfersOptions.GroupsOptions.UserDefinedOptions>()
+                            {
+                                {
+                                    group,
+                                    new Options.TransfersOptions.GroupsOptions.UserDefinedOptions()
+                                    {
+                                        Members = new[] { user },
+                                    }
+                                },
+                            }
+                        }
                     }
                 };
 
@@ -86,30 +94,33 @@
             }
 
             [Theory, AutoData]
-            public void Gives_Lowest_Priority_Group_To_Users_Appearing_In_Multiple_Groups(string group0, string  group100, string user)
+            public void Gives_Lowest_Priority_Group_To_Users_Appearing_In_Multiple_Groups(string group0, string group100, string user)
             {
                 var options = new Options()
                 {
-                    Groups = new Options.GroupsOptions()
+                    Transfers = new Options.TransfersOptions
                     {
-                        UserDefined = new Dictionary<string, Options.GroupsOptions.UserDefinedOptions>()
+                        Groups = new Options.TransfersOptions.GroupsOptions()
                         {
+                            UserDefined = new Dictionary<string, Options.TransfersOptions.GroupsOptions.UserDefinedOptions>()
                             {
-                                group100,
-                                new Options.GroupsOptions.UserDefinedOptions()
                                 {
-                                    Upload = new Options.GroupsOptions.UploadOptions() { Priority = 100 },
-                                    Members = new[] { user },
-                                }
-                            },
-                            { 
-                                group0, 
-                                new Options.GroupsOptions.UserDefinedOptions()
+                                    group100,
+                                    new Options.TransfersOptions.GroupsOptions.UserDefinedOptions()
+                                    {
+                                        Upload = new Options.TransfersOptions.GroupsOptions.BaseGroupOptions.GroupUploadOptions() { Priority = 100 },
+                                        Members = new[] { user },
+                                    }
+                                },
                                 {
-                                    Upload = new Options.GroupsOptions.UploadOptions() { Priority = 0 },
-                                    Members = new[] { user },
-                                }
-                            },
+                                    group0,
+                                    new Options.TransfersOptions.GroupsOptions.UserDefinedOptions()
+                                    {
+                                        Upload = new Options.TransfersOptions.GroupsOptions.BaseGroupOptions.GroupUploadOptions() { Priority = 0 },
+                                        Members = new[] { user },
+                                    }
+                                },
+                            }
                         }
                     }
                 };
@@ -120,7 +131,7 @@
             }
         }
 
-        private static (UserService governor, Mocks mocks) GetFixture(Options options = null)
+        private static (UserService service, Mocks mocks) GetFixture(Options options = null)
         {
             var mocks = new Mocks(options);
             var service = new UserService(

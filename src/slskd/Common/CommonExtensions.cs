@@ -29,6 +29,7 @@ namespace slskd
     using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
+    using Microsoft.AspNetCore.Mvc.ModelBinding;
     using YamlDotNet.Serialization;
     using YamlDotNet.Serialization.NamingConventions;
 
@@ -116,7 +117,7 @@ namespace slskd
                         differences.Add((prop, fqn, leftVal, rightVal));
                     }
                 }
-                else if (propType.IsPrimitive || Nullable.GetUnderlyingType(propType) != null || new[] { typeof(string), typeof(decimal) }.Contains(propType))
+                else if (propType.IsPrimitive || propType.IsEnum || Nullable.GetUnderlyingType(propType) != null || new[] { typeof(string), typeof(decimal) }.Contains(propType))
                 {
                     if (!Equals(leftVal, rightVal))
                     {
@@ -133,15 +134,46 @@ namespace slskd
         }
 
         /// <summary>
+        ///     Makes a best-guess determination of the directory separator character used by a remote system,
+        ///     based on the characters present in the specified <paramref name="remoteFilename"/>.
+        /// </summary>
+        /// <param name="remoteFilename">The fully qualified remote filename to inspect.</param>
+        /// <returns>The guessed directory separator.</returns>
+        public static char GuessDirectorySeparator(this string remoteFilename)
+        {
+            // forward slash is a forbidden character on all operating systems; if the specified string contains it,
+            // then it is coming from the OS's directory separator
+            if (remoteFilename.Contains('/'))
+            {
+                return '/';
+            }
+
+            // if the given string doesn't contain any forward slashes, it either lacks a directory separator at all
+            // (potentially impossible?) or it is using backspaces. backspaces are used by all major clients, so
+            // this should be a safe assumption.
+            return '\\';
+        }
+
+        /// <summary>
+        ///     Returns the directory name of the given <paramref name="path"/>, using the specified <paramref name="directorySeparator"/>
+        ///     to split and join directories and filename.
+        /// </summary>
+        /// <param name="path">The path for which to return the directory name.</param>
+        /// <param name="directorySeparator">The directory separator character.</param>
+        /// <returns>The specified path, less the last segment.</returns>
+        public static string GetDirectoryName(this string path, char directorySeparator)
+        {
+            return string.Join(directorySeparator, path.Split(directorySeparator).SkipLast(1));
+        }
+
+        /// <summary>
         ///     Returns the directory from the given path, regardless of separator format.
         /// </summary>
         /// <param name="path">The path.</param>
         /// <returns>The directory.</returns>
         public static string DirectoryName(this string path)
         {
-            var separator = path.Contains('\\') ? '\\' : '/';
-            var parts = path.Split(separator);
-            return string.Join(separator, parts.Take(parts.Length - 1));
+            return path.GetDirectoryName(path.GuessDirectorySeparator());
         }
 
         /// <summary>
@@ -209,7 +241,7 @@ namespace slskd
         }
 
         /// <summary>
-        ///     Replaces the first occurance of <paramref name="phrase"/> in the string with <paramref name="replacement"/>.
+        ///     Replaces the first occurrence of <paramref name="phrase"/> in the string with <paramref name="replacement"/>.
         /// </summary>
         /// <param name="str">The string on which to perform the replacement.</param>
         /// <param name="phrase">The phrase or substring to replace.</param>
@@ -307,7 +339,7 @@ namespace slskd
         /// </summary>
         /// <typeparam name="T">The type to which to deserialize the string.</typeparam>
         /// <param name="str">The string to deserialize.</param>
-        /// <returns>The new object deserialzied from the string.</returns>
+        /// <returns>The new object deserialized from the string.</returns>
         public static T FromYaml<T>(this string str) => new DeserializerBuilder()
             .WithNamingConvention(UnderscoredNamingConvention.Instance)
             .Build()
@@ -401,7 +433,7 @@ namespace slskd
         }
 
         /// <summary>
-        ///     Replaces any occurance of an invalid filename character with the specified <see paramref="replacement"/>.
+        ///     Replaces any occurrence of an invalid filename character with the specified <see paramref="replacement"/>.
         /// </summary>
         /// <param name="path">The path to sanitize.</param>
         /// <param name="replacement">The character with which to replace invalid characters.</param>
@@ -416,6 +448,39 @@ namespace slskd
             }
 
             return sanitized;
+        }
+
+        /// <summary>
+        ///     Converts a ModelStateDictionary into a human-readable format.
+        /// </summary>
+        /// <param name="dictionary">The ModelStateDictionary to format.</param>
+        /// <returns>The formatted error string.</returns>
+        public static string GetReadableString(this ModelStateDictionary dictionary)
+        {
+            if (dictionary == null || dictionary.IsValid)
+            {
+                return string.Empty;
+            }
+
+            return dictionary.Values
+                .Where(v => v.Errors.Any())
+                .Select(v =>
+                    v.Errors
+                        .Select(e => GetErrorAndOrExceptionMessage(e))
+                        .Aggregate((a, b) => string.Join(", ", new[] { a, b })))
+                .Aggregate((a, b) => string.Join(" ", new[] { a, b }));
+        }
+
+        /// <summary>
+        ///     Returns the <see cref="ModelError.ErrorMessage"/>, the <see cref="Exception.Message"/> for the ModelError, or both if both are present.
+        /// </summary>
+        /// <param name="error">The ModelError from which to retrieve the error message.</param>
+        /// <returns>The retrieved error message.</returns>
+        public static string GetErrorAndOrExceptionMessage(this ModelError error)
+        {
+            var ex = error?.Exception?.Message;
+            return string.IsNullOrEmpty(error?.ErrorMessage) ? ex :
+                string.IsNullOrEmpty(ex) ? error?.ErrorMessage : $"{error?.ErrorMessage} ({ex})";
         }
 
         /// <summary>
@@ -451,7 +516,7 @@ namespace slskd
         /// </summary>
         /// <typeparam name="T">The type to which to deserialize the string.</typeparam>
         /// <param name="str">The string to deserialize.</param>
-        /// <returns>The new object deserialzied from the string.</returns>
+        /// <returns>The new object deserialized from the string.</returns>
         public static T FromJson<T>(this string str) => JsonSerializer.Deserialize<T>(str, GetJsonSerializerOptions());
 
         private static JsonSerializerOptions GetJsonSerializerOptions()
@@ -459,6 +524,7 @@ namespace slskd
             var options = new JsonSerializerOptions();
             options.Converters.Add(new IPAddressConverter());
             options.Converters.Add(new JsonStringEnumConverter());
+            options.Converters.Add(new KnownUnsupportedTypeConverter());
             options.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
             options.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
             return options;
