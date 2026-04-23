@@ -33,6 +33,7 @@ const Searches = ({ server } = {}) => {
   const location = useLocation();
   const match = useRouteMatch();
   const autoSearchedRef = useRef(false);
+  const [pendingAutoSearchId, setPendingAutoSearchId] = useState(undefined);
 
   const onConnecting = () => {
     setConnecting(true);
@@ -190,9 +191,30 @@ const Searches = ({ server } = {}) => {
     if (searchText) {
       autoSearchedRef.current = true;
       history.replace(location.pathname);
-      create({ navigate: true, search: searchText });
+      const id = uuidv4();
+      setPendingAutoSearchId(id);
+      library.create({ id, searchText }).catch((createError) => {
+        console.error(createError);
+        toast.error(
+          createError?.response?.data ??
+            createError?.message ??
+            createError,
+        );
+        setPendingAutoSearchId(undefined);
+      });
     }
   }, [connecting, server?.isConnected, location.search]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // once the pending auto-search appears in state (via the hub create
+  // event), navigate to its detail view. this avoids a race where the
+  // navigation would land before the search is known and get bounced back.
+  useEffect(() => {
+    if (pendingAutoSearchId && searches[pendingAutoSearchId]) {
+      const target = `${match.url.replace(`/${searchId}`, '')}/${pendingAutoSearchId}`;
+      setPendingAutoSearchId(undefined);
+      history.push(target);
+    }
+  }, [pendingAutoSearchId, searches]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (connecting) {
     return <LoaderSegment />;
