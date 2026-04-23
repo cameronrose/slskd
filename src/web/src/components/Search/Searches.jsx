@@ -196,9 +196,7 @@ const Searches = ({ server } = {}) => {
       library.create({ id, searchText }).catch((createError) => {
         console.error(createError);
         toast.error(
-          createError?.response?.data ??
-            createError?.message ??
-            createError,
+          createError?.response?.data ?? createError?.message ?? createError,
         );
         setPendingAutoSearchId(undefined);
       });
