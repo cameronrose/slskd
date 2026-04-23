@@ -7,7 +7,12 @@ import PlaceholderSegment from '../Shared/PlaceholderSegment';
 import SearchDetail from './Detail/SearchDetail';
 import SearchList from './List/SearchList';
 import React, { useEffect, useRef, useState } from 'react';
-import { useHistory, useParams, useRouteMatch } from 'react-router-dom';
+import {
+  useHistory,
+  useLocation,
+  useParams,
+  useRouteMatch,
+} from 'react-router-dom';
 import { toast } from 'react-toastify';
 import { Button, Icon, Input, Segment } from 'semantic-ui-react';
 import { v4 as uuidv4 } from 'uuid';
@@ -25,7 +30,9 @@ const Searches = ({ server } = {}) => {
 
   const { id: searchId } = useParams();
   const history = useHistory();
+  const location = useLocation();
   const match = useRouteMatch();
+  const autoSearchedRef = useRef(false);
 
   const onConnecting = () => {
     setConnecting(true);
@@ -168,6 +175,24 @@ const Searches = ({ server } = {}) => {
       setStopping(false);
     }
   };
+
+  // if the URL contains a ?searchText= query parameter, kick off a search
+  // with that phrase once the hub is connected and the server is ready.
+  // guarded by a ref so it only fires once per page load.
+  useEffect(() => {
+    if (connecting || !server?.isConnected || autoSearchedRef.current) {
+      return;
+    }
+
+    const params = new URLSearchParams(location.search);
+    const searchText = params.get('searchText');
+
+    if (searchText) {
+      autoSearchedRef.current = true;
+      history.replace(location.pathname);
+      create({ navigate: true, search: searchText });
+    }
+  }, [connecting, server?.isConnected, location.search]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (connecting) {
     return <LoaderSegment />;
