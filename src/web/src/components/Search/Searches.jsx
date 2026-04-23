@@ -184,8 +184,8 @@ const Searches = ({ server } = {}) => {
       return;
     }
 
-    const params = new URLSearchParams(location.search);
-    const searchText = params.get('searchText');
+    const parameters = new URLSearchParams(location.search);
+    const searchText = parameters.get('searchText');
 
     if (searchText) {
       autoSearchedRef.current = true;
